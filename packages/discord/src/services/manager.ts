@@ -2,7 +2,7 @@ import { statSync } from "node:fs"
 import path from "node:path"
 import type { ServiceSummary } from "../memory/digest"
 import { run } from "../self/update"
-import { findFreePort, isListening, isPortFree, type PortRange } from "./ports"
+import { findFreePort, isListening, isPortFree, waitPortFree, type PortRange } from "./ports"
 import { isAlive, scrubEnv, spawnDetached, stopProcess, tailFile } from "./process"
 import type { ServiceRecord, ServiceStore } from "./store"
 
@@ -268,6 +268,8 @@ export class ServiceManager {
     this.options.store.update(service.name, { desired: "stopped" })
     await stopProcess(service.pid, service.pid_start)
     this.options.store.update(service.name, { status: "stopped", pid: null, pid_start: null })
+    // The process is gone but its port may take a moment to come back; a restart right now would fail with "address in use".
+    if (service.port !== null) await waitPortFree(service.port)
   }
 
   private async waitReady(name: string) {

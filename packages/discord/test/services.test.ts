@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { ServiceManager, type ManagerOptions } from "../src/services/manager"
-import { findFreePort, isListening, isPortFree, parsePortRange } from "../src/services/ports"
+import { findFreePort, isListening, isPortFree, parsePortRange, waitPortFree } from "../src/services/ports"
 import { isAlive, scrubEnv } from "../src/services/process"
 import { ServiceStore } from "../src/services/store"
 import { openDatabase } from "../src/store/db"
@@ -71,6 +71,24 @@ describe("ports", () => {
       server.close()
     }
     expect(await isListening(port)).toBe(false)
+  })
+
+  test("waitPortFree returns as soon as a port that was busy is released, and gives up on one that never is", async () => {
+    const server = net.createServer().listen(0, "0.0.0.0")
+    await new Promise((resolve) => server.once("listening", resolve))
+    const port = (server.address() as net.AddressInfo).port
+    setTimeout(() => server.close(), 200)
+    const started = Date.now()
+    expect(await waitPortFree(port, 3000)).toBe(true)
+    expect(Date.now() - started).toBeLessThan(2000)
+
+    const stuck = net.createServer().listen(0, "0.0.0.0")
+    await new Promise((resolve) => stuck.once("listening", resolve))
+    try {
+      expect(await waitPortFree((stuck.address() as net.AddressInfo).port, 300)).toBe(false)
+    } finally {
+      stuck.close()
+    }
   })
 
   test("findFreePort returns nothing when the range is exhausted", async () => {

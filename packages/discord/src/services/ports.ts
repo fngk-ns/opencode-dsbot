@@ -42,3 +42,13 @@ export async function findFreePort(range: PortRange, taken: Set<number>, probe: 
   }
   return undefined
 }
+
+/** Waits until the port can be bound again. A stopped process can hold its port for a moment, which would make an immediate restart fail. */
+export async function waitPortFree(port: number, timeoutMs = 3000, probe: (port: number) => Promise<boolean> = isPortFree) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await probe(port)) return true
+    await Bun.sleep(50)
+  }
+  return probe(port)
+}
