@@ -1,0 +1,67 @@
+# 인텐트 ↔ 이벤트 매핑
+
+범례 — ✅ `discord.py@2.7.1` 의 인텐트별 이벤트 목록과 `discord-api-types` 로 확인 · ⚠️ 공식 문서 직접 대조 불가 · 🔒 특권
+
+## A. 인텐트 → 이벤트
+
+| 인텐트 | 받는 Dispatch 이벤트 |
+|---|---|
+| **GUILDS** (1<<0) | `GUILD_CREATE` `GUILD_UPDATE` `GUILD_DELETE` · `GUILD_ROLE_CREATE` `GUILD_ROLE_UPDATE` `GUILD_ROLE_DELETE` · `CHANNEL_CREATE` `CHANNEL_UPDATE` `CHANNEL_DELETE` `CHANNEL_PINS_UPDATE` · `THREAD_CREATE` `THREAD_UPDATE` `THREAD_DELETE` `THREAD_LIST_SYNC` `THREAD_MEMBER_UPDATE` `THREAD_MEMBERS_UPDATE`(봇 자신 한정) · `STAGE_INSTANCE_CREATE` `STAGE_INSTANCE_UPDATE` `STAGE_INSTANCE_DELETE` |
+| 🔒 **GUILD_MEMBERS** (1<<1) | `GUILD_MEMBER_ADD` `GUILD_MEMBER_UPDATE` `GUILD_MEMBER_REMOVE` · `THREAD_MEMBERS_UPDATE`(전체 멤버) |
+| **GUILD_MODERATION** (1<<2) | `GUILD_AUDIT_LOG_ENTRY_CREATE` `GUILD_BAN_ADD` `GUILD_BAN_REMOVE` |
+| **GUILD_EXPRESSIONS** (1<<3) | `GUILD_EMOJIS_UPDATE` `GUILD_STICKERS_UPDATE` `GUILD_SOUNDBOARD_SOUND_CREATE` `GUILD_SOUNDBOARD_SOUND_UPDATE` `GUILD_SOUNDBOARD_SOUND_DELETE` `GUILD_SOUNDBOARD_SOUNDS_UPDATE` |
+| **GUILD_INTEGRATIONS** (1<<4) | `GUILD_INTEGRATIONS_UPDATE` `INTEGRATION_CREATE` `INTEGRATION_UPDATE` `INTEGRATION_DELETE` |
+| **GUILD_WEBHOOKS** (1<<5) | `WEBHOOKS_UPDATE` |
+| **GUILD_INVITES** (1<<6) | `INVITE_CREATE` `INVITE_DELETE` |
+| **GUILD_VOICE_STATES** (1<<7) | `VOICE_STATE_UPDATE` `VOICE_CHANNEL_EFFECT_SEND` ⚠️ · (음성 연결 시 필수) |
+| 🔒 **GUILD_PRESENCES** (1<<8) | `PRESENCE_UPDATE` |
+| **GUILD_MESSAGES** (1<<9) | `MESSAGE_CREATE` `MESSAGE_UPDATE` `MESSAGE_DELETE` `MESSAGE_DELETE_BULK` (서버) |
+| **GUILD_MESSAGE_REACTIONS** (1<<10) | `MESSAGE_REACTION_ADD` `MESSAGE_REACTION_REMOVE` `MESSAGE_REACTION_REMOVE_ALL` `MESSAGE_REACTION_REMOVE_EMOJI` (서버) |
+| **GUILD_MESSAGE_TYPING** (1<<11) | `TYPING_START` (서버) |
+| **DIRECT_MESSAGES** (1<<12) | `MESSAGE_CREATE` `MESSAGE_UPDATE` `MESSAGE_DELETE` `CHANNEL_PINS_UPDATE` (DM) |
+| **DIRECT_MESSAGE_REACTIONS** (1<<13) | `MESSAGE_REACTION_*` 4종 (DM) |
+| **DIRECT_MESSAGE_TYPING** (1<<14) | `TYPING_START` (DM) |
+| 🔒 **MESSAGE_CONTENT** (1<<15) | *(이벤트 추가 없음)* — 메시지 이벤트의 `content/embeds/attachments/components` 및 AutoMod 실행 이벤트의 `content/matched_content` 를 채움 |
+| **GUILD_SCHEDULED_EVENTS** (1<<16) | `GUILD_SCHEDULED_EVENT_CREATE` `_UPDATE` `_DELETE` `_USER_ADD` `_USER_REMOVE` |
+| **AUTO_MODERATION_CONFIGURATION** (1<<20) | `AUTO_MODERATION_RULE_CREATE` `_UPDATE` `_DELETE` |
+| **AUTO_MODERATION_EXECUTION** (1<<21) | `AUTO_MODERATION_ACTION_EXECUTION` |
+| **GUILD_MESSAGE_POLLS** (1<<24) | `MESSAGE_POLL_VOTE_ADD` `MESSAGE_POLL_VOTE_REMOVE` (서버) |
+| **DIRECT_MESSAGE_POLLS** (1<<25) | `MESSAGE_POLL_VOTE_ADD` `MESSAGE_POLL_VOTE_REMOVE` (DM) |
+
+## B. 인텐트가 **필요 없는** 이벤트
+
+| 이벤트 | 비고 |
+|---|---|
+| `READY` `RESUMED` | 연결 이벤트 |
+| `RATE_LIMITED` | 신규 — Op 8 제한 알림 ✅ |
+| `INTERACTION_CREATE` | 슬래시/컨텍스트/버튼/셀렉트/모달/자동완성 — **인텐트 0 으로도 수신** ⚠️ |
+| `APPLICATION_COMMAND_PERMISSIONS_UPDATE` | 커맨드 권한 변경 ⚠️ |
+| `ENTITLEMENT_CREATE/UPDATE/DELETE` | 수익화(프리미엄 앱) ⚠️ |
+| `SUBSCRIPTION_CREATE/UPDATE/DELETE` | 수익화 구독 ⚠️ |
+| `USER_UPDATE` | **봇 자신**의 유저 정보 변경 ⚠️ (다른 유저의 변경은 `GUILD_MEMBER_UPDATE`/`PRESENCE_UPDATE`) |
+| `VOICE_SERVER_UPDATE` | 음성 서버 할당 알림 ⚠️ |
+| `GUILD_MEMBERS_CHUNK` | Op 8 요청의 응답 (요청 자체에 `GUILD_MEMBERS` 필요) |
+| `SOUNDBOARD_SOUNDS` | Op 31 요청의 응답 |
+| `CHANNEL_INFO` | Op 43 요청의 응답 |
+
+## C. 확인이 덜 된 항목 ⚠️
+
+타입 정의에는 있으나 인텐트·권한 요건이 타입만으로는 확정되지 않는 신규 이벤트.
+
+| 이벤트 | 추정 | 비고 |
+|---|---|---|
+| `VOICE_CHANNEL_STATUS_UPDATE` | `GUILD_VOICE_STATES` 로 추정 | discord.py 2.7.1 은 미파싱 → 공식 문서 대조 필요 |
+| `VOICE_CHANNEL_START_TIME_UPDATE` | 동일 | 〃 |
+| `CHANNEL_INFO` | 인텐트 없음(요청 응답) | 〃 |
+
+## D. 이벤트에 추가 **권한**이 필요한 경우 ⚠️
+
+| 이벤트 | 필요 권한 |
+|---|---|
+| `GUILD_AUDIT_LOG_ENTRY_CREATE` | `VIEW_AUDIT_LOG` |
+| `INVITE_CREATE` / `INVITE_DELETE` | 해당 채널 `MANAGE_CHANNELS` |
+| `WEBHOOKS_UPDATE` | (인텐트만) — 자세한 내용은 웹훅 목록 조회 권한 `MANAGE_WEBHOOKS` |
+| 채널 관련 모든 이벤트 | 봇이 **볼 수 있는**(`VIEW_CHANNEL`) 채널에 대해서만 전달 |
+
+## E. "암시적 관계" 주의 ✅
+discord.py 문서: 메시지 인텐트(`GUILD_MESSAGES`)는 `on_reaction_add` 등 반응 캐시와 암묵적으로 연관되나, **실제 Dispatch 구독은 `*_MESSAGE_REACTIONS` 인텐트가 결정**한다. 캐시된 메시지에 반응을 붙이려면 두 인텐트를 함께 켜는 것이 안전.
