@@ -38,6 +38,13 @@ function harness(options: { autoApprove?: boolean; failPrompt?: string } = {}) {
     async models() {
       return []
     },
+    async fork() {
+      return "ses_forked"
+    },
+    async summarize() {},
+    async summaryOf() {
+      return undefined
+    },
   }
   const surface: Surface = {
     async send(_, value) {

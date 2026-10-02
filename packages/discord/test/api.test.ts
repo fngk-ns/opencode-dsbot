@@ -9,6 +9,13 @@ import type { OutFile } from "../src/discord/outbound"
 import { openDatabase } from "../src/store/db"
 import { MessageStore, type StoredMessage } from "../src/store/messages"
 import type { ModelInfo } from "../src/models"
+import { AdminActions } from "../src/admin/actions"
+import { AuditLog } from "../src/admin/audit"
+import { PendingActions } from "../src/admin/pending"
+import type { GuildPort } from "../src/admin/types"
+import { MemoryStore } from "../src/memory/store"
+import { ServiceManager } from "../src/services/manager"
+import { ServiceStore } from "../src/services/store"
 
 const TOKEN = "secret-token"
 const model = (provider: string, id: string, name: string, released: string): ModelInfo => ({
@@ -66,7 +73,7 @@ const directory: Directory = {
   roles: () => [],
 }
 
-function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean } = {}) {
+function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean; confirm?: boolean } = {}) {
   const store = new MessageStore(openDatabase(":memory:"))
   store.save(stored("1001", "g1", "c1", "deploy finished"))
   store.save(stored("1002", "g2", "c9", "deploy secret from another server"))
@@ -74,7 +81,41 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean 
   const restarts: string[] = []
   const remoteCalls: string[] = []
   const modelChanges: Array<{ scope: string; ref: string | null }> = []
-  const current: ApiContext = { channelId: "c1", guildId: "g1", directory: path.join(temp, "project"), kind: "project", speakerId: "owner1", ...context }
+  const db = openDatabase(":memory:")
+  const memory = new MemoryStore(db)
+  const audit = new AuditLog(db)
+  const timeouts: string[] = []
+  const port = {
+    guildId: "g1",
+    ownerId: "boss",
+    botId: "bot",
+    members: () => [{ id: "m1", username: "alice", global_name: null, display_name: "Alice", nickname: null, bot: false, roles: [], joined_at: null }],
+    channels: () => [],
+    roles: () => [],
+    can: () => true,
+    topRole: () => 5,
+    rolePosition: () => 0,
+    timeout: async (userId: string) => void timeouts.push(userId),
+  } as unknown as GuildPort
+  const admin = new AdminActions({
+    guild: (id) => (id === "g1" ? port : undefined),
+    messages: store,
+    audit,
+    pending: new PendingActions(),
+    isOwner: (id) => id === "owner1",
+    askConfirm: async () => undefined,
+  })
+  const services = new ServiceManager({
+    store: new ServiceStore(db),
+    logDir: path.join(temp, "svc-logs"),
+    range: { min: 32000, max: 32010 },
+    reservedPorts: () => new Set(),
+    allowLowPorts: false,
+    publicHost: () => "203.0.113.7",
+  })
+  const branches: Array<{ title: string; history: boolean; prompt?: string }> = []
+  const confirms: Array<{ description: string; run: () => Promise<string> }> = []
+  const current: ApiContext = { channelId: "c1", guildId: "g1", directory: path.join(temp, "project"), project: "project", kind: "project", speakerId: "owner1", ...context }
   const deps: ApiDeps = {
     token: TOKEN,
     lookup: createLookup({
@@ -96,6 +137,14 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean 
     currentModels: () => ({ thread: null, default: null }),
     setModel: (_, scope, ref) => void modelChanges.push({ scope, ref }),
     isOwner: (userId) => userId === "owner1",
+    memory,
+    services,
+    confirmServices: options.confirm ? async (_, description, run) => (confirms.push({ description, run }), "c-1") : undefined,
+    admin,
+    audit,
+    speakerName: (_, userId) => userId,
+    branch: async (_, input) => (branches.push(input), { ok: true, thread: "<#new>", session_id: "ses_new", directory: "/w", branch: "thread/x", inherited_history: input.history }),
+    close: async () => ({ ok: true, message: "closed" }),
   }
   const handle = createApiHandler(deps)
   const post = (route: string, body: object, token = TOKEN) =>
@@ -106,7 +155,7 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean 
         body: JSON.stringify(body),
       }),
     )
-  return { post, sent, restarts, remoteCalls, handle, modelChanges }
+  return { post, sent, restarts, remoteCalls, handle, modelChanges, memory, services, timeouts, branches, audit, confirms }
 }
 
 describe("api auth and routing", () => {
@@ -248,5 +297,166 @@ describe("settings: changing the model by chat", () => {
   test("set_model without a query is rejected", async () => {
     const { post } = setup()
     expect((await (await post("/settings", { session_id: "ses_1", action: "set_model" })).json()).ok).toBe(false)
+  })
+})
+
+describe("memory tool", () => {
+  test("project and thread notes can be saved by anyone; shared notes need an owner", async () => {
+    const guest = setup({ speakerId: "guest" })
+    const project = await (await guest.post("/memory", { session_id: "ses_1", action: "save", kind: "decision", title: "DB", body: "sqlite 사용" })).json()
+    expect(project).toMatchObject({ ok: true, entry: { scope: "project:project", kind: "decision" } })
+    const shared = await (await guest.post("/memory", { session_id: "ses_1", action: "save", scope: "global", title: "x", body: "y" })).json()
+    expect(shared).toMatchObject({ ok: false })
+    expect(guest.memory.list({ scopes: ["global"] })).toEqual([])
+
+    const owner = setup()
+    const saved = await (await owner.post("/memory", { session_id: "ses_1", action: "save", scope: "global", kind: "preference", title: "언어", body: "한국어", pinned: true })).json()
+    expect(saved).toMatchObject({ ok: true, entry: { scope: "global", pinned: true } })
+  })
+
+  test("a guest cannot pin, and cannot edit or forget shared entries", async () => {
+    const t = setup()
+    const entry = t.memory.save({ scope: "global", kind: "fact", title: "서버", body: "ubuntu" })
+    const guest = await (await t.post("/memory", { session_id: "ses_1", action: "save", title: "n", body: "b", pinned: true })).json()
+    expect(guest.entry.pinned).toBe(true) // the owner (default speaker) may pin
+
+    const stranger = setup({ speakerId: "guest" })
+    const shared = stranger.memory.save({ scope: "global", kind: "fact", title: "서버", body: "ubuntu" })
+    expect(await (await stranger.post("/memory", { session_id: "ses_1", action: "forget", id: shared.id })).json()).toMatchObject({ ok: false })
+    expect(await (await stranger.post("/memory", { session_id: "ses_1", action: "update", id: shared.id, body: "hacked" })).json()).toMatchObject({ ok: false })
+    expect(stranger.memory.get(shared.id)?.body).toBe("ubuntu")
+    expect(entry.id).toBeGreaterThan(0)
+  })
+
+  test("memory from other servers' scopes is invisible", async () => {
+    const t = setup()
+    const other = t.memory.save({ scope: "guild:g2", kind: "fact", title: "secret", body: "from server two" })
+    expect(await (await t.post("/memory", { session_id: "ses_1", action: "get", id: other.id })).json()).toMatchObject({ ok: false })
+    const found = await (await t.post("/memory", { session_id: "ses_1", action: "search", query: "server two" })).json()
+    expect(found.entries).toEqual([])
+  })
+
+  test("tasks can be listed, completed and searched; threads are listed from the journal", async () => {
+    const t = setup()
+    const task = (await (await t.post("/memory", { session_id: "ses_1", action: "save", kind: "task", title: "배포", body: "블로그 올리기" })).json()).entry
+    expect(task.status).toBe("open")
+    const open = await (await t.post("/memory", { session_id: "ses_1", action: "list", kind: "task" })).json()
+    expect(open.entries).toHaveLength(1)
+    await t.post("/memory", { session_id: "ses_1", action: "update", id: task.id, status: "done" })
+    expect((await (await t.post("/memory", { session_id: "ses_1", action: "list", kind: "task" })).json()).entries).toEqual([])
+
+    t.memory.openThread({ thread_id: "c1", guild_id: "g1", title: "블로그 작업" })
+    t.memory.openThread({ thread_id: "c9", guild_id: "g2", title: "다른 서버" })
+    const threads = await (await t.post("/memory", { session_id: "ses_1", action: "threads" })).json()
+    expect(threads.threads.map((item: { title: string }) => item.title)).toEqual(["블로그 작업"])
+  })
+})
+
+describe("service tool", () => {
+  test("only an owner can change services, but anyone can look", async () => {
+    const guest = setup({ speakerId: "guest" })
+    expect(await (await guest.post("/services", { session_id: "ses_1", action: "deploy", name: "x", command: "true" })).json()).toMatchObject({ ok: false })
+    expect(await (await guest.post("/services", { session_id: "ses_1", action: "stop", name: "x" })).json()).toMatchObject({ ok: false })
+    expect(await (await guest.post("/services", { session_id: "ses_1", action: "list" })).json()).toMatchObject({ ok: true, services: [] })
+    expect(await (await guest.post("/services", { session_id: "ses_1", action: "ports" })).json()).toMatchObject({ ok: true, free_in_range: 11 })
+  })
+
+  test("deploy must stay inside the project or workspace", async () => {
+    const t = setup()
+    const outside = await (await t.post("/services", { session_id: "ses_1", action: "deploy", name: "evil", command: "true", directory: "/etc" })).json()
+    expect(outside).toMatchObject({ ok: false, error: expect.stringContaining("inside") })
+    expect(t.services.ledger().used).toEqual([])
+  })
+
+  test("an owner deploys a real server and the ledger remembers its port", async () => {
+    const t = setup()
+    await Bun.write(path.join(temp, "project", "app.js"), "Bun.serve({ port: Number(process.env.PORT), fetch: () => new Response('ok') }); setInterval(() => {}, 1000)\n")
+    const result = await (await t.post("/services", { session_id: "ses_1", action: "deploy", name: "demo", command: "bun app.js" })).json()
+    try {
+      expect(result).toMatchObject({ ok: true, ready: true, port: 32000, url: "http://203.0.113.7:32000" })
+      const listed = await (await t.post("/services", { session_id: "ses_1", action: "get", name: "demo" })).json()
+      expect(listed).toMatchObject({ ok: true, port: 32000, listening: true })
+    } finally {
+      await t.services.remove("demo")
+    }
+  })
+})
+
+describe("service tool in ask mode", () => {
+  test("deploy and remove wait for a button and only run when it is pressed", async () => {
+    const t = setup({}, { confirm: true })
+    await Bun.write(path.join(temp, "project", "app.js"), "Bun.serve({ port: Number(process.env.PORT), fetch: () => new Response('ok') }); setInterval(() => {}, 1000)\n")
+    const asked = await (await t.post("/services", { session_id: "ses_1", action: "deploy", name: "later", command: "bun app.js" })).json()
+    expect(asked).toMatchObject({ ok: true, pending: true, confirm_id: "c-1" })
+    expect(t.services.ledger().used).toEqual([])
+    expect(t.confirms[0].description).toContain("later")
+
+    try {
+      expect(await t.confirms[0].run()).toContain("http://203.0.113.7:32000")
+      expect(t.services.ledger().used).toEqual([{ port: 32000, service: "later" }])
+
+      const removal = await (await t.post("/services", { session_id: "ses_1", action: "remove", name: "later" })).json()
+      expect(removal).toMatchObject({ pending: true })
+      expect(t.services.ledger().used).toHaveLength(1)
+      expect(await t.confirms[1].run()).toContain("32000")
+      expect(t.services.ledger().used).toEqual([])
+    } finally {
+      await t.services.remove("later")
+    }
+  })
+
+  test("reading and stopping are not gated", async () => {
+    const t = setup({}, { confirm: true })
+    expect(await (await t.post("/services", { session_id: "ses_1", action: "list" })).json()).toMatchObject({ ok: true })
+    expect(t.confirms).toEqual([])
+  })
+})
+
+describe("admin tool", () => {
+  test("a request is validated and reaches the guild with the right requester", async () => {
+    const t = setup({ speakerId: "owner1" })
+    const done = await (await t.post("/admin", { session_id: "ses_1", action: "timeout", user: "alice", minutes: 10 })).json()
+    expect(done).toMatchObject({ ok: true })
+    expect(t.timeouts).toEqual(["m1"])
+    expect(t.audit.recent("g1")[0]).toMatchObject({ actor_id: "owner1", action: "timeout", ok: true })
+  })
+
+  test("bad input is rejected, and DMs have no server to manage", async () => {
+    const t = setup()
+    expect((await t.post("/admin", { session_id: "ses_1", action: "explode" })).status).toBe(400)
+    expect((await t.post("/admin", { session_id: "ses_1", action: "timeout", user: "alice" })).status).toBe(400)
+    const dm = setup({ guildId: null })
+    expect(await (await dm.post("/admin", { session_id: "ses_1", action: "timeout", user: "alice", minutes: 5 })).json()).toMatchObject({ ok: false })
+  })
+
+  test("the audit log is owner-only", async () => {
+    const guest = setup({ speakerId: "guest" })
+    expect(await (await guest.post("/admin", { session_id: "ses_1", action: "audit" })).json()).toMatchObject({ ok: false })
+    const owner = setup()
+    await owner.post("/admin", { session_id: "ses_1", action: "timeout", user: "alice", minutes: 5 })
+    const log = await (await owner.post("/admin", { session_id: "ses_1", action: "audit" })).json()
+    expect(log.entries[0]).toMatchObject({ action: "timeout", ok: true })
+  })
+})
+
+describe("thread tool", () => {
+  test("fork inherits history, new does not, and a title is required", async () => {
+    const t = setup()
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "fork", title: "다크모드", prompt: "구현해줘" })).json()).toMatchObject({ ok: true, inherited_history: true })
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "new", title: "새 주제" })).json()).toMatchObject({ ok: true, inherited_history: false })
+    expect(t.branches).toEqual([
+      { title: "다크모드", history: true, prompt: "구현해줘" },
+      { title: "새 주제", history: false, prompt: undefined },
+    ])
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "fork" })).json()).toMatchObject({ ok: false })
+  })
+
+  test("info, list and close", async () => {
+    const t = setup()
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "info" })).json()).toMatchObject({ ok: false })
+    t.memory.openThread({ thread_id: "c1", guild_id: "g1", title: "지금 스레드" })
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "info" })).json()).toMatchObject({ ok: true, thread: { title: "지금 스레드" } })
+    expect((await (await t.post("/threads", { session_id: "ses_1", action: "list" })).json()).threads).toHaveLength(1)
+    expect(await (await t.post("/threads", { session_id: "ses_1", action: "close" })).json()).toMatchObject({ ok: true })
   })
 })

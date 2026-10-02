@@ -134,14 +134,18 @@ export function createLookup(input: {
   return { message, messages, search, member, memberList, channels, roles, guilds }
 }
 
-/** Exact id/mention first, then exact name, prefix, substring. Case-insensitive. */
-export function rankMembers(members: MemberInfo[], query: string, limit: number) {
+/** Exact id/mention first, then exact name, prefix, substring. Case-insensitive. Best match first, with its score. */
+export function scoreMembers(members: MemberInfo[], query: string) {
   const needle = query.trim().replace(/^<@!?(\d+)>$/, "$1").replace(/^@/, "").toLowerCase()
   if (!needle) return []
   return members
     .map((item) => ({ item, score: score(item, needle) }))
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score || a.item.display_name.localeCompare(b.item.display_name))
+}
+
+export function rankMembers(members: MemberInfo[], query: string, limit: number) {
+  return scoreMembers(members, query)
     .slice(0, limit)
     .map((entry) => entry.item)
 }

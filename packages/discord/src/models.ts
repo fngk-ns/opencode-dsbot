@@ -7,6 +7,8 @@ export type ModelInfo = {
   family?: string
   status: string
   released: string
+  /** Context window in tokens, when the provider reports it. */
+  context?: number
 }
 
 // When the same model is offered by several providers, the maker's own provider wins.

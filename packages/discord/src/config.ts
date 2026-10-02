@@ -1,5 +1,6 @@
 import os from "node:os"
 import path from "node:path"
+import { parsePortRange } from "./services/ports"
 
 export type Config = ReturnType<typeof loadConfig>
 
@@ -43,6 +44,21 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     messageRetentionDays: number(env.MESSAGE_RETENTION_DAYS, 0),
     // Safety valve for the only REST message reads: explicit message ID or link lookups that miss the cache.
     restLookupsPerMinute: number(env.REST_LOOKUPS_PER_MINUTE, 20),
+
+    // Deployment: services get ports from this range, and are reachable at PUBLIC_HOST (auto-detected when empty).
+    servicesDir: path.join(dataDir, "services"),
+    portRange: parsePortRange(env.PORT_RANGE),
+    allowLowPorts: env.ALLOW_LOW_PORTS === "true",
+    publicHost: env.PUBLIC_HOST || undefined,
+    firewallOpen: env.FIREWALL_OPEN_CMD || undefined,
+    firewallClose: env.FIREWALL_CLOSE_CMD || undefined,
+
+    // Memory and long conversations.
+    memoryBudgetChars: number(env.MEMORY_BUDGET_CHARS, 6000),
+    compactRatio: Math.min(Math.max(number(env.COMPACT_RATIO, 0.7), 0.3), 0.95),
+    compactFallbackTokens: number(env.COMPACT_FALLBACK_TOKENS, 120_000),
+    // Each new thread in a git project gets its own branch and worktree.
+    branchPerThread: env.BRANCH_PER_THREAD !== "false",
   }
 }
 

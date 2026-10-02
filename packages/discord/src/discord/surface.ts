@@ -49,6 +49,19 @@ export class DiscordSurface implements Surface {
     })
   }
 
+  async askAdminConfirm(channelId: string, confirmId: string, description: string) {
+    const channel = await this.channel(channelId)
+    await channel.send({
+      content: `⚠️ **확인이 필요합니다** — ${description}\n되돌리기 어려운 작업입니다. 요청한 사람 또는 소유자가 5분 안에 눌러 주세요.`.slice(0, 1900),
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId(`admin:yes:${confirmId}`).setLabel("실행").setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId(`admin:no:${confirmId}`).setLabel("취소").setStyle(ButtonStyle.Secondary),
+        ),
+      ],
+    })
+  }
+
   async askRestart(channelId: string, reason: string) {
     const channel = await this.channel(channelId)
     await channel.send({

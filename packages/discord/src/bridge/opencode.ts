@@ -114,6 +114,11 @@ export type Engine = {
   createSession(directory: string, title: string): Promise<string>
   /** Models of the providers that have credentials configured. */
   models(directory: string): Promise<ModelInfo[]>
+  /** Copies the conversation into a new session whose working directory is `directory`. */
+  fork(sessionId: string, directory: string): Promise<string>
+  summarize(sessionId: string, directory: string, model: { providerID: string; modelID: string }): Promise<void>
+  /** The text of the most recent compaction summary, if the session has one. */
+  summaryOf(sessionId: string, directory: string): Promise<string | undefined>
 }
 
 /**
@@ -164,8 +169,28 @@ export function createEngine(client: OpencodeClient): Engine {
             family: model.family,
             status: model.status,
             released: model.release_date,
+            context: model.limit.context,
           })),
         )
+    },
+    async fork(sessionId, directory) {
+      const result = await client.session.fork({ sessionID: sessionId, directory })
+      if (result.error || !result.data) throw new Error(`failed to fork session: ${JSON.stringify(result.error)}`)
+      return result.data.id
+    },
+    async summarize(sessionId, directory, model) {
+      const result = await client.session.summarize({ sessionID: sessionId, directory, providerID: model.providerID, modelID: model.modelID })
+      if (result.error) throw new Error(`failed to compact session: ${JSON.stringify(result.error)}`)
+    },
+    async summaryOf(sessionId, directory) {
+      const result = await client.session.messages({ sessionID: sessionId, directory, limit: 30 })
+      const summary = (result.data ?? []).filter((item) => item.info.role === "assistant" && item.info.summary).at(-1)
+      if (!summary) return
+      const text = summary.parts
+        .flatMap((part) => (part.type === "text" ? [part.text.trim()] : []))
+        .filter(Boolean)
+        .join("\n\n")
+      return text || undefined
     },
     async createSession(directory, title) {
       const result = await client.session.create({ directory, title, permission: NON_INTERACTIVE_RULES })

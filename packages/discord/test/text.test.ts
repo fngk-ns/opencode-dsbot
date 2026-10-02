@@ -96,6 +96,10 @@ describe("parseDirectives", () => {
     ])
     expect(parseDirectives("/stop").directives).toEqual([{ kind: "stop" }])
     expect(parseDirectives("/models").directives).toEqual([{ kind: "models" }])
+    expect(parseDirectives("/fork 다크모드 구현").directives).toEqual([{ kind: "fork" }])
+    expect(parseDirectives("/fork 다크모드 구현").rest).toBe("다크모드 구현")
+    expect(parseDirectives("/tasks").directives).toEqual([{ kind: "tasks" }])
+    expect(parseDirectives("/services").directives).toEqual([{ kind: "services" }])
     expect(parseDirectives("/model sonnet").directives).toEqual([{ kind: "model", model: "sonnet" }])
   })
 

@@ -4,22 +4,22 @@ import type { createLookup } from "../cache/lookup"
 import { resolveSendable } from "../discord/files"
 import type { OutFile } from "../discord/outbound"
 import { matchModels, type ModelInfo } from "../models"
-import type { BindingKind } from "../store/bindings"
+import type { MemoryStore } from "../memory/store"
+import type { ServiceManager } from "../services/manager"
+import { memoryRoute } from "./memory-routes"
+import { reply, type ApiContext } from "./shared"
+import { serviceRoute, type ServiceDeps } from "./service-routes"
+import { adminRoute, type AdminRouteDeps } from "./admin-routes"
+import { threadRoute, type ThreadDeps } from "./thread-routes"
 
 export type Lookup = ReturnType<typeof createLookup>
 
-/** What the bot knows about the Discord thread behind an opencode session. */
-export type ApiContext = {
-  channelId: string
-  guildId: string | null
-  directory: string
-  kind: BindingKind
-  /** The person whose message is being answered, used for owner-only settings. */
-  speakerId: string | null
-}
+export type { ApiContext } from "./shared"
 
-export type ApiDeps = {
+export type ApiDeps = AdminRouteDeps & ThreadDeps & Pick<ServiceDeps, "confirmServices"> & {
   token: string
+  memory: MemoryStore
+  services: ServiceManager
   lookup: Lookup
   context(sessionId: string): ApiContext | undefined
   guildOfChannel(channelId: string): string | null | undefined
@@ -94,6 +94,10 @@ export function createApiHandler(deps: ApiDeps) {
     if (route === "/send-file") return sendFile(deps, context, body)
     if (route === "/restart") return restart(deps, context, body)
     if (route === "/settings") return settings(deps, context, body)
+    if (route === "/memory") return memoryRoute(deps, context, body)
+    if (route === "/services") return serviceRoute(deps, context, body)
+    if (route === "/admin") return adminRoute(deps, context, body)
+    if (route === "/threads") return threadRoute(deps, context, body)
     return reply(404, { ok: false, error: "not found" })
   }
 }
@@ -230,8 +234,4 @@ function authorized(header: string | null, token: string) {
   const given = Buffer.from(header?.replace(/^Bearer\s+/i, "") ?? "")
   const expected = Buffer.from(token)
   return given.length === expected.length && timingSafeEqual(given, expected)
-}
-
-function reply(status: number, payload: object) {
-  return Response.json(payload, { status })
 }

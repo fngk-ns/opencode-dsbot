@@ -1,20 +1,26 @@
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { MessageFlags, type Client, type Interaction, type Message, type SendableChannels } from "discord.js"
+import { MessageFlags, type ButtonInteraction, type Client, type Interaction, type Message, type SendableChannels } from "discord.js"
+import type { PendingActions } from "./admin/pending"
 import type { Lookup } from "./api/server"
 import type { Engine } from "./bridge/opencode"
 import { systemPrompt, userPrompt, type ReferenceContext } from "./bridge/prompt"
 import type { RunManager } from "./bridge/runs"
+import { digestKey } from "./memory/compaction"
+import { buildDigest, digestHash } from "./memory/digest"
+import { scopesFor, type MemoryStore } from "./memory/store"
 import type { MemberWarmer } from "./cache/directory"
 import { parseModel, type Config } from "./config"
 import { resolveModel } from "./models"
 import { HELP_TEXT, parseDirectives, type Directive } from "./directives"
-import { saveAttachments, toFilePart } from "./discord/files"
+import { saveAttachments, toFilePart, type SavedFile } from "./discord/files"
 import { findMessageLinks } from "./discord/links"
 import { toStored } from "./discord/record"
 import type { DiscordSurface } from "./discord/surface"
+import type { ServiceManager } from "./services/manager"
 import type { Binding, BindingStore, KeyValueStore } from "./store/bindings"
 import type { MessageStore, StoredAttachment } from "./store/messages"
+import { projectDir, workingCopy, type BranchResult } from "./threads/branch"
 
 export type RouterDeps = {
   client: Client
@@ -29,10 +35,14 @@ export type RouterDeps = {
   lookup: Lookup
   warmer: MemberWarmer
   surface: DiscordSurface
+  memory: MemoryStore
+  services: ServiceManager
+  pending: PendingActions
+  branch(binding: Binding, input: { title: string; history: boolean; prompt?: string; speakerId: string }): Promise<BranchResult>
   restartNow(reason: string, channelId: string): Promise<void>
 }
 
-const IN_PLACE = new Set<Directive["kind"]>(["help", "status", "cache", "models", "stop", "restart"])
+const IN_PLACE = new Set<Directive["kind"]>(["help", "status", "cache", "models", "tasks", "memory", "services", "threads", "stop", "restart"])
 export const DEFAULT_MODEL_KEY = "default_model"
 const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
@@ -73,6 +83,10 @@ export function createRouter(deps: RouterDeps) {
     }
 
     const parsed = parseDirectives(stripMention(message.content, deps.client.user!.id))
+    if (!bound && parsed.directives.some((item) => item.kind === "fork")) {
+      await message.reply("`/fork` 는 봇이 만든 스레드 안에서 쓰는 명령이에요. 스레드에서 `/fork 제목` 으로 분기하세요.").catch(() => undefined)
+      return
+    }
     // A bare command such as `@bot /status` is answered in place instead of opening a thread for nothing.
     const commandOnly = !parsed.rest && parsed.directives.length > 0 && parsed.directives.every((item) => IN_PLACE.has(item.kind))
     const target = bound || commandOnly ? await sendable(message.channelId) : await openThread(message, parsed.rest)
@@ -86,6 +100,12 @@ export function createRouter(deps: RouterDeps) {
 
     const binding = await ensureBinding({ message, target, directives: parsed.directives, owner, title: parsed.rest, notice })
     if (!binding) return
+
+    if (parsed.directives.some((item) => item.kind === "fork")) {
+      const forked = await deps.branch(binding, { title: parsed.rest || "branch", history: true, prompt: parsed.rest || undefined, speakerId: message.author.id })
+      if (!forked.ok) await notice(`분기하지 못했어요: ${forked.error}`)
+      return
+    }
 
     const stored = toStored(message)
     const context = await gather(message, binding.directory)
@@ -105,23 +125,87 @@ export function createRouter(deps: RouterDeps) {
       saved: context.saved,
       skipped: context.skipped,
     })
-    deps.speakers.set(binding.session_id, message.author.id)
-    const model = modelFor(binding)
+    const result = await submit(binding, { prompt, files: context.saved, authorId: message.author.id, summary: parsed.rest || "(첨부파일)", guildId: message.guildId })
+    if (result === "queued") await message.react("📥").catch(() => undefined)
+  }
+
+  /** Sends one prompt into a bound conversation, with the shared-memory briefing when it is new or has changed. */
+  async function submit(binding: Binding, input: { prompt: string; files: SavedFile[]; authorId: string; summary: string; guildId: string | null }) {
+    deps.speakers.set(binding.session_id, input.authorId)
+    ensureJournal(binding, input.guildId, input.summary)
+    deps.memory.touchThread(binding.channel_id, input.summary)
+
+    const briefing = briefingFor(binding, input.guildId)
+    const record = deps.memory.thread(binding.channel_id)
     const result = await deps.runs.submit(
-      { sessionId: binding.session_id, channelId: target.id, directory: binding.directory },
+      { sessionId: binding.session_id, channelId: binding.channel_id, directory: binding.directory },
       {
-        parts: [{ type: "text", text: prompt }, ...context.saved.flatMap((file) => toFilePart(file) ?? [])],
+        parts: [
+          ...(briefing ? [{ type: "text" as const, text: briefing.text }] : []),
+          { type: "text" as const, text: input.prompt },
+          ...input.files.flatMap((file) => toFilePart(file) ?? []),
+        ],
         system: systemPrompt({
           kind: binding.kind,
           directory: binding.directory,
           selfDir: deps.config.selfDir,
           maxUploadMb: Math.round(deps.config.maxUploadBytes / 1024 / 1024),
+          branch: record?.branch ? { name: record.branch, baseDirectory: path.join(deps.config.workspaceDir, record.project ?? "default") } : undefined,
         }),
-        model,
+        model: modelFor(binding),
         agent: binding.agent ?? deps.config.agent,
       },
     )
-    if (result === "queued") await message.react("📥").catch(() => undefined)
+    // Remember what the conversation has been told only once the prompt was accepted.
+    if (briefing) deps.kv.set(digestKey(binding.session_id), briefing.hash)
+    return result
+  }
+
+  function briefingFor(binding: Binding, guildId: string | null) {
+    const thread = deps.memory.thread(binding.channel_id)
+    const text = buildDigest({
+      entries: deps.memory.list({ scopes: scopesFor({ guildId, project: projectOf(binding), threadId: binding.channel_id }), limit: 300 }),
+      services: deps.services.summaries(),
+      thread,
+      parent: thread?.parent_thread ? deps.memory.thread(thread.parent_thread) : undefined,
+      recent: deps.memory.threads({ guildId, limit: 8 }),
+      budget: deps.config.memoryBudgetChars,
+    })
+    const hash = digestHash(text)
+    if (!text || deps.kv.get(digestKey(binding.session_id)) === hash) return
+    return { text, hash }
+  }
+
+  function projectOf(binding: Binding) {
+    return binding.kind === "self" ? "self" : projectDir(deps.config.workspaceDir, binding.directory)
+  }
+
+  /** Every conversation has a journal row, including ones that predate the journal. */
+  function ensureJournal(binding: Binding, guildId: string | null, title: string) {
+    if (deps.memory.thread(binding.channel_id)) return
+    const channel = deps.client.channels.cache.get(binding.channel_id)
+    deps.memory.openThread({
+      thread_id: binding.channel_id,
+      guild_id: guildId,
+      title: channel && "name" in channel && channel.name ? channel.name : title.slice(0, 90) || "DM",
+      project: projectOf(binding),
+      directory: binding.directory,
+    })
+  }
+
+  /** Starts work in a conversation without a user message, for example the first prompt of a branched thread. */
+  async function promptThread(binding: Binding, text: string, authorId: string) {
+    const record = deps.memory.thread(binding.channel_id)
+    const prompt = userPrompt({
+      author: { id: authorId, name: deps.client.users.cache.get(authorId)?.username ?? authorId },
+      channelLabel: `thread ${binding.channel_id}`,
+      now: new Date(),
+      text,
+      linked: [],
+      saved: [],
+      skipped: [],
+    })
+    await submit(binding, { prompt, files: [], authorId, summary: text, guildId: record?.guild_id ?? null })
   }
 
   async function openThread(message: Message, text: string) {
@@ -158,6 +242,8 @@ export function createRouter(deps: RouterDeps) {
     }
     if (has("stop")) {
       const stopped = binding ? await deps.runs.abort(binding.session_id) : false
+      // Queued prompts are dropped, and one of them may have carried the memory briefing.
+      if (binding) deps.kv.delete(digestKey(binding.session_id))
       await input.notice(stopped ? "⏹️ 작업을 중단했습니다." : "진행 중인 작업이 없습니다.")
       return true
     }
@@ -167,6 +253,10 @@ export function createRouter(deps: RouterDeps) {
         return true
       }
       await deps.restartNow("manual /restart", input.target.id)
+      return true
+    }
+    if (has("tasks") || has("memory") || has("services") || has("threads")) {
+      await input.notice(summaryReport(has, binding, input.message))
       return true
     }
     if (has("models")) {
@@ -217,6 +307,30 @@ export function createRouter(deps: RouterDeps) {
   /** The model for this thread: its own override, else the owner-set default, else the configured one. */
   function modelFor(binding: Binding) {
     return parseModel(binding.model ?? deps.kv.get(DEFAULT_MODEL_KEY) ?? undefined) ?? deps.config.model
+  }
+
+  function summaryReport(has: (kind: Directive["kind"]) => boolean, binding: Binding | undefined, message: Message) {
+    const scopes = scopesFor({ guildId: message.guildId, project: binding ? projectOf(binding) : null, threadId: message.channelId })
+    if (has("services")) return servicesReport()
+    if (has("threads")) {
+      const found = deps.memory.threads({ guildId: message.guildId, limit: 10 })
+      if (found.length === 0) return "아직 기록된 스레드가 없습니다."
+      return ["**최근 스레드**", ...found.map((item) => `• <#${item.thread_id}> ${item.title} (${item.state}, ${item.turns}턴)${item.parent_thread ? ` ← <#${item.parent_thread}>` : ""}${item.branch ? ` \`${item.branch}\`` : ""} — ${(item.summary ?? item.last_request ?? "").replace(/\s+/g, " ").slice(0, 80)}`)].join("\n")
+    }
+    if (has("tasks")) {
+      const tasks = deps.memory.list({ scopes, kinds: ["task"], statuses: ["open", "blocked"], limit: 25 })
+      if (tasks.length === 0) return "열린 작업이 없습니다."
+      return ["**열린 작업**", ...tasks.map((item) => `• #${item.id} [${item.status}] **${item.title}** — ${item.body.replace(/\s+/g, " ").slice(0, 100)}`)].join("\n")
+    }
+    const entries = deps.memory.list({ scopes, limit: 25 }).filter((item) => item.kind !== "task")
+    if (entries.length === 0) return "저장된 공통 메모리가 없습니다. 에이전트에게 \"이거 기억해\" 라고 하면 저장해요."
+    return ["**공통 메모리**", ...entries.map((item) => `• #${item.id} [${item.kind}${item.scope === "global" ? "" : ` ${item.scope}`}]${item.pinned ? " 📌" : ""} **${item.title}** — ${item.body.replace(/\s+/g, " ").slice(0, 100)}`)].join("\n")
+  }
+
+  function servicesReport() {
+    const services = deps.services.summaries()
+    if (services.length === 0) return "배포된 서비스가 없습니다."
+    return ["**서비스 / 포트**", ...services.map((item) => `• \`${item.name}\` ${item.port === null ? "(포트 없음)" : `:${item.port}`} ${item.status}${item.url ? ` ${item.url}` : ""}`)].join("\n")
   }
 
   function cacheReport() {
@@ -273,8 +387,11 @@ export function createRouter(deps: RouterDeps) {
     await mkdir(directory, { recursive: true })
     const chosen = model ? await chooseModel(model.model, directory, input.notice) : undefined
     if (model && !chosen) return
+    // In a git project every new thread works on its own branch and worktree, so parallel threads cannot trample each other.
+    const workdir = kind === "project" ? await workingCopy(deps.config, { directory }, input.title || "thread", input.target.id) : { directory, branch: null }
+    if ("note" in workdir) await input.notice(`⚠️ ${workdir.note}`)
     const sessionId = await deps.engine
-      .createSession(directory, `Discord ${input.message.author.username}: ${input.title.slice(0, 60) || input.target.id}`)
+      .createSession(workdir.directory, `Discord ${input.message.author.username}: ${input.title.slice(0, 60) || input.target.id}`)
       .catch(async (error: unknown) => {
         await input.notice(`세션을 만들지 못했습니다: ${error instanceof Error ? error.message : String(error)}`)
         return undefined
@@ -285,7 +402,7 @@ export function createRouter(deps: RouterDeps) {
     const binding: Binding = {
       channel_id: input.target.id,
       session_id: sessionId,
-      directory,
+      directory: workdir.directory,
       kind,
       owner_id: input.message.author.id,
       model: chosen ?? existing?.model ?? null,
@@ -293,6 +410,15 @@ export function createRouter(deps: RouterDeps) {
       created_at: Date.now(),
     }
     deps.bindings.set(binding)
+    deps.memory.openThread({
+      thread_id: input.target.id,
+      guild_id: input.message.guildId,
+      title: ("name" in input.target && input.target.name) || input.title.slice(0, 90) || "thread",
+      project: kind === "self" ? "self" : projectDir(deps.config.workspaceDir, directory),
+      directory: workdir.directory,
+      branch: workdir.branch,
+    })
+    if (workdir.branch) await input.notice(`🌿 git 브랜치 \`${workdir.branch}\` 에서 작업합니다 (작업 폴더 \`${workdir.directory}\`).`)
     return binding
   }
 
@@ -333,8 +459,12 @@ export function createRouter(deps: RouterDeps) {
   async function onInteraction(interaction: Interaction) {
     if (!interaction.isButton()) return
     const [kind, ...rest] = interaction.customId.split(":")
-    if (kind !== "perm" && kind !== "restart") return
-    if (!deps.config.ownerIds.has(interaction.user.id)) {
+    if (kind !== "perm" && kind !== "restart" && kind !== "admin") return
+    const owner = deps.config.ownerIds.has(interaction.user.id)
+
+    // Server-management confirmations belong to whoever asked (or an owner); the other buttons are owner-only.
+    if (kind === "admin") return confirmAdmin(interaction, rest[0], rest[1], owner)
+    if (!owner) {
       await interaction.reply({ content: "소유자만 승인할 수 있습니다.", flags: MessageFlags.Ephemeral }).catch(() => undefined)
       return
     }
@@ -357,7 +487,21 @@ export function createRouter(deps: RouterDeps) {
     await deps.restartNow("self-modification approved", interaction.channelId)
   }
 
-  return { onMessage, onInteraction }
+  async function confirmAdmin(interaction: ButtonInteraction, verb: string, id: string, owner: boolean) {
+    if (verb === "no") {
+      const cancelled = deps.pending.cancel(id, interaction.user.id, owner)
+      if (!cancelled.ok) return void (await interaction.reply({ content: cancelled.error, flags: MessageFlags.Ephemeral }).catch(() => undefined))
+      await interaction.update({ content: `${interaction.message.content}\n→ 취소됨`, components: [] })
+      return
+    }
+    const taken = deps.pending.take(id, interaction.user.id, owner)
+    if (!taken.ok) return void (await interaction.reply({ content: taken.error, flags: MessageFlags.Ephemeral }).catch(() => undefined))
+    await interaction.update({ content: `${interaction.message.content}\n→ 실행 중… (${interaction.user.username})`, components: [] })
+    const outcome = await taken.action.run()
+    await interaction.followUp({ content: outcome }).catch(() => undefined)
+  }
+
+  return { onMessage, onInteraction, promptThread }
 }
 
 export function mentionsBot(message: Message) {

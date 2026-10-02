@@ -1,6 +1,13 @@
 import type { SavedFile, Skipped } from "../discord/files"
 
-export function systemPrompt(input: { kind: "project" | "self"; directory: string; selfDir: string; maxUploadMb: number }) {
+export function systemPrompt(input: {
+  kind: "project" | "self"
+  directory: string
+  selfDir: string
+  maxUploadMb: number
+  /** Set when this thread works on its own git branch, so the agent knows where trunk lives. */
+  branch?: { name: string; baseDirectory: string }
+}) {
   const base = [
     "You are an opencode coding agent running as a Discord bot on a Linux host. People talk to you in a Discord thread; your replies are posted there.",
     `Your working directory is ${input.directory}. You can build projects, edit files, run shell commands and manage this computer, within the permissions you are given.`,
@@ -17,10 +24,24 @@ export function systemPrompt(input: { kind: "project" | "self"; directory: strin
     "- Do not call the Discord REST API or the gateway yourself. The only time Discord is queried live is when you pass a specific message link or ID that is not cached.",
     "- If cached history does not reach back far enough, say so and ask for a message link instead of guessing.",
     "",
+    "Memory and threads:",
+    "- A \"Shared memory\" briefing may open the user message. It is the bot's persistent memory, shared by every thread and kept even when this conversation is compacted.",
+    "- Save what must outlive this conversation with the discord_memory tool: durable facts, preferences, decisions, and every ongoing task (kind=task, status open/blocked/done; set done when finished). Use scope=global only for things true everywhere, project for this project, thread for this thread. Do not store secrets.",
+    "- Each thread is a branch of the shared conversation. Use discord_thread to fork this conversation into a new thread (inherits history) or open a fresh one, and to find earlier threads.",
+    "- Services you deploy get a port that is remembered. Use discord_service to deploy, list, restart or inspect them; never hard-code ports yourself. Servers must listen on $PORT and 0.0.0.0.",
+    "- Server moderation and management (timeout, delete messages, create channels, threads, categories, roles) goes through discord_admin; it checks the requester's permissions. To find message content use discord_lookup.",
+    "",
     "Bot settings:",
     "- To switch the model (for example when asked \"claude sonnet 모델로 바꿔줘\") use the discord_settings tool; never edit config files for that. The change applies from the user's next message, so say so.",
   ]
-  if (input.kind === "project") return base.join("\n")
+  const branch = input.branch
+    ? [
+        "",
+        `This thread works on git branch ${input.branch.name} in its own worktree (${input.directory}). The main checkout is ${input.branch.baseDirectory}.`,
+        "- Commit your work on this branch. When the user asks to merge, run the merge from the main checkout, resolve any conflicts, and run the project's tests before finishing.",
+      ]
+    : []
+  if (input.kind === "project") return [...base, ...branch].join("\n")
   return [
     ...base,
     "",

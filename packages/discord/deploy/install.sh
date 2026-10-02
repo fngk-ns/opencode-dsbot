@@ -77,5 +77,6 @@ Discord Developer Portal checklist (Bot tab):
   [x] SERVER MEMBERS INTENT   (member cache)
   [x] MESSAGE CONTENT INTENT  (message cache)
 Invite URL (replace CLIENT_ID):
-  https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot&permissions=309237746752
+  https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot&permissions=1495051381846
+  (permissions=309237746752 = without server-management powers)
 MSG
