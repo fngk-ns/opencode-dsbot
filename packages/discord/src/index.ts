@@ -11,7 +11,7 @@ import { loadConfig } from "./config"
 import { createClient } from "./discord/client"
 import { editPatch, toStored } from "./discord/record"
 import { DiscordSurface } from "./discord/surface"
-import { createRouter } from "./router"
+import { createRouter, DEFAULT_MODEL_KEY } from "./router"
 import { snapshotHealthy, verifySelf } from "./self/update"
 import { BindingStore, KeyValueStore } from "./store/bindings"
 import { openDatabase } from "./store/db"
@@ -43,6 +43,7 @@ const lookup = createLookup({
   },
 })
 
+const speakers = new Map<string, string>()
 const apiToken = crypto.randomUUID()
 const api = startApi({
   token: apiToken,
@@ -56,8 +57,20 @@ const api = startApi({
       guildId: channel && "guildId" in channel ? channel.guildId : null,
       directory: binding.directory,
       kind: binding.kind,
+      speakerId: speakers.get(sessionId) ?? null,
     }
   },
+  models: (directory) => engine.models(directory),
+  currentModels: (context) => ({
+    thread: bindings.get(context.channelId)?.model ?? null,
+    default: kv.get(DEFAULT_MODEL_KEY) ?? null,
+  }),
+  setModel(context, scope, ref) {
+    if (scope === "thread") return bindings.update(context.channelId, { model: ref })
+    if (!ref) return kv.delete(DEFAULT_MODEL_KEY)
+    kv.set(DEFAULT_MODEL_KEY, ref)
+  },
+  isOwner: (userId) => !!userId && config.ownerIds.has(userId),
   guildOfChannel(channelId) {
     const channel = client.channels.cache.get(channelId)
     if (!channel) return
@@ -100,7 +113,7 @@ const stopEvents = new AbortController()
 void followEvents(opencode.client, (event) => void runs.handle(event).catch(logError("event")), stopEvents.signal)
 const reconcileTimer = setInterval(() => void runs.reconcile().catch(logError("reconcile")), 30_000)
 
-const router = createRouter({ client, config, messages, bindings, runs, engine, lookup, warmer, surface, restartNow })
+const router = createRouter({ client, config, messages, bindings, kv, speakers, runs, engine, lookup, warmer, surface, restartNow })
 
 let ready = false
 client.on(Events.MessageCreate, router.onMessage)

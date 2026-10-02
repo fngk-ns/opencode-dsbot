@@ -95,6 +95,8 @@ describe("parseDirectives", () => {
       { kind: "self" },
     ])
     expect(parseDirectives("/stop").directives).toEqual([{ kind: "stop" }])
+    expect(parseDirectives("/models").directives).toEqual([{ kind: "models" }])
+    expect(parseDirectives("/model sonnet").directives).toEqual([{ kind: "model", model: "sonnet" }])
   })
 
   test("unknown slash text stays in the prompt", () => {

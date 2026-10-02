@@ -3,6 +3,7 @@ import { z } from "zod"
 import type { createLookup } from "../cache/lookup"
 import { resolveSendable } from "../discord/files"
 import type { OutFile } from "../discord/outbound"
+import { matchModels, type ModelInfo } from "../models"
 import type { BindingKind } from "../store/bindings"
 
 export type Lookup = ReturnType<typeof createLookup>
@@ -13,6 +14,8 @@ export type ApiContext = {
   guildId: string | null
   directory: string
   kind: BindingKind
+  /** The person whose message is being answered, used for owner-only settings. */
+  speakerId: string | null
 }
 
 export type ApiDeps = {
@@ -24,6 +27,10 @@ export type ApiDeps = {
   maxUploadBytes: number
   send(channelId: string, text: string, files: OutFile[]): Promise<void>
   restart(context: ApiContext, reason: string): Promise<{ ok: boolean; message: string }>
+  models(directory: string): Promise<ModelInfo[]>
+  currentModels(context: ApiContext): { thread: string | null; default: string | null }
+  setModel(context: ApiContext, scope: "thread" | "default", ref: string | null): void
+  isOwner(userId: string | null): boolean
 }
 
 const lookupBody = z.discriminatedUnion("action", [
@@ -61,6 +68,12 @@ const lookupBody = z.discriminatedUnion("action", [
 const withSession = { session_id: z.string() }
 const sendFileBody = z.object({ ...withSession, path: z.string(), caption: z.string().optional() })
 const restartBody = z.object({ ...withSession, reason: z.string().min(1) })
+const settingsBody = z.object({
+  ...withSession,
+  action: z.enum(["models", "get", "set_model", "reset_model"]),
+  query: z.string().optional(),
+  scope: z.enum(["thread", "default"]).optional(),
+})
 
 /**
  * HTTP surface for the custom opencode tools. It listens on loopback only and needs the bearer token that the bot
@@ -80,6 +93,7 @@ export function createApiHandler(deps: ApiDeps) {
     if (route === "/lookup") return lookup(deps, context, body)
     if (route === "/send-file") return sendFile(deps, context, body)
     if (route === "/restart") return restart(deps, context, body)
+    if (route === "/settings") return settings(deps, context, body)
     return reply(404, { ok: false, error: "not found" })
   }
 }
@@ -165,6 +179,51 @@ async function restart(deps: ApiDeps, context: ApiContext, raw: unknown) {
   if (!parsed.success) return reply(400, { ok: false, error: parsed.error.message })
   if (context.kind !== "self") return reply(200, { ok: false, error: "restart is only available in a /self session" })
   return reply(200, await deps.restart(context, parsed.data.reason))
+}
+
+async function settings(deps: ApiDeps, context: ApiContext, raw: unknown) {
+  const parsed = settingsBody.safeParse(raw)
+  if (!parsed.success) return reply(400, { ok: false, error: parsed.error.message })
+  const input = parsed.data
+  const scope = input.scope ?? "thread"
+
+  if (input.action === "get") return reply(200, { ok: true, ...deps.currentModels(context) })
+
+  const models = await deps.models(context.directory)
+  if (input.action === "models") {
+    const found = input.query ? matchModels(input.query, models) : models
+    return reply(200, { ok: true, total: found.length, models: found.slice(0, 40).map((item) => item.ref) })
+  }
+
+  // Everything below changes which model answers, so it needs a connected provider and, for the default, an owner.
+  if (scope === "default" && !deps.isOwner(context.speakerId))
+    return reply(200, { ok: false, error: "only an owner can change the default model for new conversations; use scope=thread" })
+
+  if (input.action === "reset_model") {
+    deps.setModel(context, scope, null)
+    return reply(200, { ok: true, scope, message: "model override removed; the default is used again" })
+  }
+
+  if (!input.query) return reply(200, { ok: false, error: "query is required, for example \"claude sonnet\"" })
+  if (models.length === 0)
+    return reply(200, { ok: false, error: "no model provider is connected; set a provider API key (for example ANTHROPIC_API_KEY) or run opencode auth login on the host" })
+  const matches = matchModels(input.query, models)
+  const best = matches[0]
+  if (!best)
+    return reply(200, {
+      ok: false,
+      error: `no connected model matches "${input.query}"`,
+      available_providers: [...new Set(models.map((item) => item.provider))],
+    })
+  deps.setModel(context, scope, best.ref)
+  return reply(200, {
+    ok: true,
+    scope,
+    model: best.ref,
+    name: best.name,
+    alternatives: matches.slice(1, 5).map((item) => item.ref),
+    note: "Takes effect from the next message; the reply being written now still uses the previous model.",
+  })
 }
 
 function authorized(header: string | null, token: string) {

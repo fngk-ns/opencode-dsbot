@@ -35,6 +35,9 @@ function harness(options: { autoApprove?: boolean; failPrompt?: string } = {}) {
     async createSession() {
       return "ses_new"
     },
+    async models() {
+      return []
+    },
   }
   const surface: Surface = {
     async send(_, value) {

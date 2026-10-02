@@ -18,6 +18,7 @@ describe("systemPrompt", () => {
     expect(text).toContain("/work/blog")
     expect(text).toContain("discord_lookup")
     expect(text).toContain("discord_send_file")
+    expect(text).toContain("discord_settings")
     expect(text).toContain("Do not call the Discord REST API")
     expect(text).not.toContain("SELF-MODIFICATION")
     expect(text).not.toContain("discord_restart")

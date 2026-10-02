@@ -2,6 +2,8 @@ import { createOpencodeClient, type GlobalEvent, type OpencodeClient } from "@op
 
 export type Event = GlobalEvent["payload"]
 
+import type { ModelInfo } from "../models"
+
 export type OpencodeServer = Awaited<ReturnType<typeof startOpencode>>
 
 /**
@@ -110,6 +112,8 @@ export type Engine = {
   status(directory: string): Promise<Record<string, { type: string }>>
   respondPermission(sessionId: string, permissionId: string, response: "once" | "always" | "reject", directory: string): Promise<void>
   createSession(directory: string, title: string): Promise<string>
+  /** Models of the providers that have credentials configured. */
+  models(directory: string): Promise<ModelInfo[]>
 }
 
 /**
@@ -144,6 +148,24 @@ export function createEngine(client: OpencodeClient): Engine {
     },
     async respondPermission(_sessionId, permissionId, response, directory) {
       await client.permission.reply({ requestID: permissionId, directory, reply: response })
+    },
+    async models(directory) {
+      const result = await client.provider.list({ directory })
+      if (!result.data) return []
+      const connected = new Set(result.data.connected)
+      return result.data.all
+        .filter((provider) => connected.has(provider.id))
+        .flatMap((provider) =>
+          Object.values(provider.models).map((model) => ({
+            ref: `${provider.id}/${model.id}`,
+            provider: provider.id,
+            id: model.id,
+            name: model.name,
+            family: model.family,
+            status: model.status,
+            released: model.release_date,
+          })),
+        )
     },
     async createSession(directory, title) {
       const result = await client.session.create({ directory, title, permission: NON_INTERACTIVE_RULES })

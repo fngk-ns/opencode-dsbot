@@ -16,6 +16,9 @@ export function systemPrompt(input: { kind: "project" | "self"; directory: strin
     "- Use the discord_lookup tool. It reads a local cache that the bot fills from the gateway: all current members, and every message since the bot started. This is fast and free of rate limits.",
     "- Do not call the Discord REST API or the gateway yourself. The only time Discord is queried live is when you pass a specific message link or ID that is not cached.",
     "- If cached history does not reach back far enough, say so and ask for a message link instead of guessing.",
+    "",
+    "Bot settings:",
+    "- To switch the model (for example when asked \"claude sonnet 모델로 바꿔줘\") use the discord_settings tool; never edit config files for that. The change applies from the user's next message, so say so.",
   ]
   if (input.kind === "project") return base.join("\n")
   return [

@@ -20,8 +20,17 @@ Discord 봇으로 쓰는 opencode. 채널에서 봇을 멘션하면 그 메시�
 | 답장/링크 참조 | 메시지에 답장하거나 메시지 링크를 붙이면 그 내용이 컨텍스트로 들어감 |
 | 봇 코드 고치기 | `@봇 /self 로그 포맷 바꿔줘` (소유자 전용) |
 
-요청 맨 앞에 붙이는 명령어: `/project <이름>` · `/self` · `/model provider/model` · `/agent <이름>` · `/new` · `/stop` · `/status` · `/cache` · `/restart` · `/help`  
+요청 맨 앞에 붙이는 명령어: `/project <이름>` · `/self` · `/model <이름 일부 또는 provider/model>` · `/models` · `/agent <이름>` · `/new` · `/stop` · `/status` · `/cache` · `/restart` · `/help`  
 예: `@봇 /new /project blog 다크모드 추가해줘`
+
+## 모델 선택과 Claude 연결
+
+- **Claude**: 호스트의 `.env` 에 `ANTHROPIC_API_KEY` 를 넣으면 opencode 가 `anthropic` 제공자를 자동으로 인식합니다. OpenAI·Google 등 다른 제공자도 같은 방식(환경변수 또는 `opencode auth login`)입니다.
+- **채팅으로 모델 바꾸기**: `@봇 claude sonnet 모델로 바꿔줘` 처럼 말하면 에이전트가 `discord_settings` 도구로 연결된 모델 중 가장 알맞은(= 같은 제작사 제공자 우선, 최신 릴리스) 모델을 고릅니다. **이 스레드만** 바뀌고, 다음 메시지부터 적용됩니다. 소유자는 "앞으로 새 대화는 sonnet 으로" 처럼 **기본 모델**도 바꿀 수 있습니다.
+- **명령어로 바꾸기** (모델 호출 없이 즉시): `/models` 로 목록, `/model sonnet` 또는 `/model anthropic/claude-sonnet-4-6`. 이름 일부만 써도 같은 규칙으로 매칭하고, 못 찾으면 알려줍니다.
+- 우선순위: 스레드 지정 → 소유자가 정한 기본값 → `OPENCODE_MODEL` → opencode 기본값.
+
+> 구독형 OAuth 토큰(Claude Pro/Max 로그인)을 Claude Code 로 위장해 API 처럼 쓰는 프록시(auth2api 등)는 지원하지 않습니다. Anthropic 이 구독 토큰을 Claude Code/claude.ai 전용으로 제한한 장치를 우회하는 방식이라 계정 정지 위험이 있습니다. 봇에는 공식 API 키를 쓰세요.
 
 ## 캐시 규칙 (rate limit 회피)
 
@@ -92,14 +101,15 @@ journalctl -u opencode-discord -f
 | `SELF_RESTART` | `confirm` | `confirm` / `auto` |
 | `WORKSPACE_DIR` | `~/opencode-workspace` | 프로젝트 폴더들의 상위 (`/project 이름` → `WORKSPACE_DIR/이름`) |
 | `OPENCODE_CMD` | `opencode` | opencode 실행 명령 |
-| `OPENCODE_MODEL` | | `provider/model` |
+| `ANTHROPIC_API_KEY` | | Claude 사용 (공식 API 키) |
+| `OPENCODE_MODEL` | | 기본 `provider/model` |
 | `MESSAGE_RETENTION_DAYS` | `0` | 0 = 메시지 캐시 영구 보관 |
 
 ## 개발
 
 ```bash
 cd packages/discord
-bun test            # 92개 테스트 (캐시/조회 규칙, 분할, 첨부, API, 롤백, 실행 관리 …)
+bun test            # 106개 테스트 (캐시/조회 규칙, 분할, 첨부, API, 롤백, 실행 관리 …)
 bun run typecheck
 bun run check       # 번들 가능 여부 (자기 수정 검증과 동일)
 ```

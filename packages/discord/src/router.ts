@@ -7,12 +7,13 @@ import { systemPrompt, userPrompt, type ReferenceContext } from "./bridge/prompt
 import type { RunManager } from "./bridge/runs"
 import type { MemberWarmer } from "./cache/directory"
 import { parseModel, type Config } from "./config"
+import { resolveModel } from "./models"
 import { HELP_TEXT, parseDirectives, type Directive } from "./directives"
 import { saveAttachments, toFilePart } from "./discord/files"
 import { findMessageLinks } from "./discord/links"
 import { toStored } from "./discord/record"
 import type { DiscordSurface } from "./discord/surface"
-import type { Binding, BindingStore } from "./store/bindings"
+import type { Binding, BindingStore, KeyValueStore } from "./store/bindings"
 import type { MessageStore, StoredAttachment } from "./store/messages"
 
 export type RouterDeps = {
@@ -20,6 +21,9 @@ export type RouterDeps = {
   config: Config
   messages: MessageStore
   bindings: BindingStore
+  kv: KeyValueStore
+  /** Who spoke last in each session, so tools can tell owners from other users. */
+  speakers: Map<string, string>
   runs: RunManager
   engine: Engine
   lookup: Lookup
@@ -28,7 +32,8 @@ export type RouterDeps = {
   restartNow(reason: string, channelId: string): Promise<void>
 }
 
-const IN_PLACE = new Set<Directive["kind"]>(["help", "status", "cache", "stop", "restart"])
+const IN_PLACE = new Set<Directive["kind"]>(["help", "status", "cache", "models", "stop", "restart"])
+export const DEFAULT_MODEL_KEY = "default_model"
 const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
 /**
@@ -100,7 +105,8 @@ export function createRouter(deps: RouterDeps) {
       saved: context.saved,
       skipped: context.skipped,
     })
-    const model = parseModel(binding.model ?? undefined) ?? deps.config.model
+    deps.speakers.set(binding.session_id, message.author.id)
+    const model = modelFor(binding)
     const result = await deps.runs.submit(
       { sessionId: binding.session_id, channelId: target.id, directory: binding.directory },
       {
@@ -163,6 +169,10 @@ export function createRouter(deps: RouterDeps) {
       await deps.restartNow("manual /restart", input.target.id)
       return true
     }
+    if (has("models")) {
+      await input.notice(await modelReport(binding?.directory ?? deps.config.workspaceDir))
+      return true
+    }
     if (has("cache")) {
       await input.notice(cacheReport())
       return true
@@ -173,13 +183,40 @@ export function createRouter(deps: RouterDeps) {
             `세션 \`${binding.session_id}\` · ${binding.kind === "self" ? "봇 코드(/self)" : "프로젝트"}`,
             `폴더 \`${binding.directory}\``,
             `상태 ${deps.runs.isBusy(binding.session_id) ? `작업 중 (대기열 ${deps.runs.queued(binding.session_id)})` : "대기 중"}`,
-            `모델 ${binding.model ?? deps.config.model?.modelID ?? "기본값"} · 에이전트 ${binding.agent ?? deps.config.agent ?? "기본값"}`,
+            `모델 ${binding.model ?? deps.kv.get(DEFAULT_MODEL_KEY) ?? deps.config.model?.modelID ?? "기본값"} · 에이전트 ${binding.agent ?? deps.config.agent ?? "기본값"}`,
           ]
         : ["아직 세션이 없습니다. 요청 내용을 보내면 시작됩니다."]
       await input.notice([...lines, "", cacheReport()].join("\n"))
       return true
     }
     return false
+  }
+
+  async function modelReport(directory: string) {
+    const models = await deps.engine.models(directory).catch(() => [])
+    if (models.length === 0) return "연결된 모델 제공자가 없습니다. 호스트에서 `ANTHROPIC_API_KEY` 등 키를 설정하거나 `opencode auth login` 을 실행하세요."
+    const byProvider = Map.groupBy(models, (model) => model.provider)
+    const lines = [...byProvider].map(([provider, list]) => {
+      const names = list.slice(0, 8).map((model) => `\`${model.id}\``).join(" ")
+      return `• **${provider}** (${list.length}): ${names}${list.length > 8 ? " …" : ""}`
+    })
+    return ["**쓸 수 있는 모델** — `/model provider/model` 또는 `/model sonnet` 처럼 이름 일부로 선택", ...lines].join("\n")
+  }
+
+  /** Turns `/model` text into a `provider/model` ref, accepting loose words such as `sonnet`. Tells the user when nothing matches. */
+  async function chooseModel(value: string, directory: string, notice: (text: string) => Promise<unknown>) {
+    const models = await deps.engine.models(directory).catch(() => [])
+    const found = resolveModel(value, models)
+    if (found) return found.ref
+    // No catalog to check against (for example the server is still starting): trust an explicit provider/model.
+    if (models.length === 0 && parseModel(value)) return value
+    await notice(`\`${value}\` 에 맞는 모델을 찾지 못했어요. \`/models\` 로 목록을 확인하세요.`)
+    return undefined
+  }
+
+  /** The model for this thread: its own override, else the owner-set default, else the configured one. */
+  function modelFor(binding: Binding) {
+    return parseModel(binding.model ?? deps.kv.get(DEFAULT_MODEL_KEY) ?? undefined) ?? deps.config.model
   }
 
   function cacheReport() {
@@ -216,7 +253,9 @@ export function createRouter(deps: RouterDeps) {
         await input.notice("프로젝트/`/self` 는 새 세션을 시작할 때만 고를 수 있어요. `/new /project 이름 …` 처럼 `/new` 와 함께 쓰세요.")
         return
       }
-      if (model || agent) deps.bindings.update(existing.channel_id, { model: model?.model, agent: agent?.name })
+      const chosen = model ? await chooseModel(model.model, existing.directory, input.notice) : undefined
+      if (model && !chosen) return
+      if (chosen || agent) deps.bindings.update(existing.channel_id, { model: chosen, agent: agent?.name })
       return deps.bindings.get(existing.channel_id)
     }
 
@@ -232,6 +271,8 @@ export function createRouter(deps: RouterDeps) {
     const kind = wantsSelf ? ("self" as const) : ("project" as const)
     const directory = wantsSelf ? deps.config.selfDir : path.join(deps.config.workspaceDir, project?.name ?? "default")
     await mkdir(directory, { recursive: true })
+    const chosen = model ? await chooseModel(model.model, directory, input.notice) : undefined
+    if (model && !chosen) return
     const sessionId = await deps.engine
       .createSession(directory, `Discord ${input.message.author.username}: ${input.title.slice(0, 60) || input.target.id}`)
       .catch(async (error: unknown) => {
@@ -247,7 +288,7 @@ export function createRouter(deps: RouterDeps) {
       directory,
       kind,
       owner_id: input.message.author.id,
-      model: model?.model ?? existing?.model ?? null,
+      model: chosen ?? existing?.model ?? null,
       agent: agent?.name ?? existing?.agent ?? null,
       created_at: Date.now(),
     }
