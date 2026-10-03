@@ -1,8 +1,15 @@
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle, type Client, type SendableChannels } from "discord.js"
+import type { SendableChannels } from "discord.js"
+import { type Client } from "discord.js"
 import type { Surface } from "../bridge/runs"
+import { answerMessages, confirmCard, noticeCard, permissionCard, serviceCard } from "../ui/cards"
+import { message } from "../ui/components"
+import { renderRunCard } from "../ui/run-card"
+import type { RunView } from "../ui/view"
 import { deliver, type OutFile } from "./outbound"
 
-/** The Discord side of the run manager: posting text, files, progress edits and approval buttons. */
+type CardPayload = ReturnType<typeof message>
+
+/** The Discord side of the bot: plain notices, and the Components V2 cards (run progress, answers, approvals, deployments). */
 export class DiscordSurface implements Surface {
   constructor(private readonly client: Client) {}
 
@@ -13,20 +20,29 @@ export class DiscordSurface implements Surface {
     return channel
   }
 
+  /** Plain text, split into message-sized pieces. Used for short notices and command replies. */
   async send(channelId: string, text: string, files: OutFile[] = []) {
     const channel = await this.channel(channelId)
     await deliver({ send: (payload) => channel.send(payload) }, text, files)
   }
 
-  async createProgress(channelId: string, text: string) {
+  async sendCard(channelId: string, payload: CardPayload) {
     const channel = await this.channel(channelId)
-    return (await channel.send({ content: text })).id
+    return (await channel.send(payload)).id
   }
 
-  async editProgress(channelId: string, messageId: string, text: string) {
+  /** The run card: created on the first call, edited in place afterwards. */
+  async showRun(channelId: string, view: RunView, messageId?: string) {
+    const payload = message([renderRunCard(view)])
+    if (!messageId) return this.sendCard(channelId, payload)
     const channel = await this.channel(channelId)
-    // Editing by ID works without the message being cached.
-    if ("messages" in channel) await channel.messages.edit(messageId, { content: text })
+    // Editing by ID works without the message being cached. The flag must be repeated on every edit.
+    if ("messages" in channel) await channel.messages.edit(messageId, { components: payload.components, flags: payload.flags })
+    return messageId
+  }
+
+  async sendAnswer(channelId: string, text: string) {
+    for (const payload of answerMessages(text)) await this.sendCard(channelId, payload)
   }
 
   typing(channelId: string) {
@@ -34,44 +50,29 @@ export class DiscordSurface implements Surface {
     if (channel?.isSendable()) void channel.sendTyping().catch(() => undefined)
   }
 
-  async askPermission(channelId: string, permission: { sessionId: string; id: string; title: string; detail: string }) {
-    const channel = await this.channel(channelId)
-    const id = (response: string) => `perm:${response}:${permission.sessionId}:${permission.id}`
-    await channel.send({
-      content: `🔐 **권한 요청** — ${permission.title}\n\`${permission.detail || "n/a"}\``.slice(0, 1900),
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(id("once")).setLabel("한 번 허용").setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(id("always")).setLabel("항상 허용").setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(id("reject")).setLabel("거부").setStyle(ButtonStyle.Danger),
-        ),
-      ],
-    })
+  async askPermission(channelId: string, permission: { sessionId: string; id: string; tool: string; detail: string }) {
+    await this.sendCard(channelId, permissionCard({ tool: permission.tool, detail: permission.detail, sessionId: permission.sessionId, permissionId: permission.id }))
   }
 
   async askAdminConfirm(channelId: string, confirmId: string, description: string) {
-    const channel = await this.channel(channelId)
-    await channel.send({
-      content: `⚠️ **확인이 필요합니다** — ${description}\n되돌리기 어려운 작업입니다. 요청한 사람 또는 소유자가 5분 안에 눌러 주세요.`.slice(0, 1900),
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`admin:yes:${confirmId}`).setLabel("실행").setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId(`admin:no:${confirmId}`).setLabel("취소").setStyle(ButtonStyle.Secondary),
-        ),
-      ],
-    })
+    await this.sendCard(
+      channelId,
+      confirmCard({ title: "⚠️ 확인이 필요합니다", description, yesId: `admin:yes:${confirmId}`, noId: `admin:no:${confirmId}`, note: "되돌리기 어려운 작업입니다. 요청한 사람 또는 소유자가 5분 안에 눌러 주세요." }),
+    )
   }
 
   async askRestart(channelId: string, reason: string) {
-    const channel = await this.channel(channelId)
-    await channel.send({
-      content: `🔄 **재시작 요청** — ${reason}\n검증(check/test)을 통과했습니다. 소유자가 승인하면 봇이 재시작됩니다.`.slice(0, 1900),
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId("restart:yes").setLabel("재시작").setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId("restart:no").setLabel("취소").setStyle(ButtonStyle.Secondary),
-        ),
-      ],
-    })
+    await this.sendCard(
+      channelId,
+      confirmCard({ title: "🔄 재시작 요청", description: reason, yesId: "restart:yes", noId: "restart:no", yesLabel: "재시작", note: "검증(check/test)을 통과했습니다. 소유자가 승인하면 봇이 재시작됩니다." }),
+    )
+  }
+
+  async showService(channelId: string, input: Parameters<typeof serviceCard>[0]) {
+    await this.sendCard(channelId, serviceCard(input))
+  }
+
+  async notice(channelId: string, title: string, body = "", accent?: number) {
+    await this.sendCard(channelId, noticeCard(title, body, accent))
   }
 }

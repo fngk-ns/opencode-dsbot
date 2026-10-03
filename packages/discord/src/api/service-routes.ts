@@ -26,6 +26,8 @@ export type ServiceDeps = {
    * channels, so a planted instruction must not be able to start a process just because an owner spoke last.
    */
   confirmServices?(context: ApiContext, description: string, run: () => Promise<string>): Promise<string>
+  /** Called after a successful deploy so the thread gets a deployment card with the address. */
+  announceService?(context: ApiContext, deployed: { name: string; url: string | null; local_url: string | null; port: number | null; status: string; ready: boolean; description: string | null; project: string | null }): Promise<void>
 }
 
 const READ_ONLY = new Set(["list", "get", "logs", "ports"])
@@ -42,12 +44,14 @@ export async function serviceRoute(deps: ServiceDeps, context: ApiContext, raw: 
   if (input.action === "list") return reply(200, { ok: true, services: await deps.services.list() })
   if (input.action === "ports") return reply(200, { ok: true, ...deps.services.ledger() })
 
-  if (!input.name) return reply(200, { ok: false, error: "name is required" })
-  const name = input.name
+  // A project's service is named after the project, so redeploying keeps the same service and the same port.
+  const name = input.name ?? context.project ?? undefined
+  if (!name) return reply(200, { ok: false, error: "name is required" })
 
   if (input.action === "deploy") {
     if (!input.command) return reply(200, { ok: false, error: "command is required, for example \"bun run start\" (it receives the port in $PORT)" })
-    const directory = path.resolve(context.directory, input.directory ?? ".")
+    // Deployments run from trunk (what has been merged), not from a thread's unfinished branch.
+    const directory = path.resolve(context.trunk ?? context.directory, input.directory ?? ".")
     if (!deps.roots(context).some((root) => directory === root || directory.startsWith(root + path.sep)))
       return reply(200, { ok: false, error: "directory must be inside the project or workspace" })
     const deploy = () =>
@@ -60,11 +64,16 @@ export async function serviceRoute(deps: ServiceDeps, context: ApiContext, raw: 
         description: input.description,
         autorestart: input.autorestart,
         owner_thread: context.channelId,
+        project: context.project,
         created_by: context.speakerId,
       })
-    if (!deps.confirmServices) return reply(200, await deploy())
+    const announce = async (result: Awaited<ReturnType<typeof deploy>>) => {
+      if (result.ok) await deps.announceService?.(context, { name, url: result.url, local_url: result.local_url, port: result.port, status: result.status, ready: result.ready, description: result.description, project: result.project })
+      return result
+    }
+    if (!deps.confirmServices) return reply(200, await announce(await deploy()))
     const id = await deps.confirmServices(context, `서비스 배포 \`${name}\` — \`${input.command}\` (${directory})`, async () => {
-      const result = await deploy()
+      const result = await announce(await deploy())
       return result.ok ? `✅ \`${name}\` 배포${result.ready ? "" : " (아직 포트가 열리지 않았습니다)"}: ${result.url ?? result.local_url ?? "포트 없음"}` : `❌ 배포 실패: ${result.error}`
     })
     return reply(200, { ok: true, pending: true, confirm_id: id, message: "소유자가 확인 버튼을 눌러야 배포됩니다. 다시 요청하지 말고 사용자에게 알려 주세요." })

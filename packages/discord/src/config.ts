@@ -17,6 +17,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const permissionMode = env.PERMISSION_MODE ?? "ask"
   if (permissionMode !== "ask" && permissionMode !== "auto") throw new Error("PERMISSION_MODE must be ask or auto")
 
+  // Deploying starts a process and opens a public port. "auto" lets an owner's request deploy at once; "ask" adds a button press.
+  const deployConfirm = env.DEPLOY_CONFIRM ?? "auto"
+  if (deployConfirm !== "ask" && deployConfirm !== "auto") throw new Error("DEPLOY_CONFIRM must be ask or auto")
+
   const restartMode = env.SELF_RESTART ?? "confirm"
   if (restartMode !== "confirm" && restartMode !== "auto") throw new Error("SELF_RESTART must be confirm or auto")
 
@@ -37,6 +41,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     agent: env.OPENCODE_AGENT || undefined,
     permissionMode,
     restartMode,
+    deployConfirm,
     // Discord's default upload limit for guilds without boosts.
     maxUploadBytes: number(env.MAX_UPLOAD_MB, 10) * 1024 * 1024,
     maxDownloadBytes: number(env.MAX_DOWNLOAD_MB, 25) * 1024 * 1024,

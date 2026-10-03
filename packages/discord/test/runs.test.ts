@@ -1,26 +1,27 @@
 import { describe, expect, test } from "bun:test"
-import { RunManager, type Pending, type Surface } from "../src/bridge/runs"
+import { RunManager, type Pending, type RunSummary, type Surface } from "../src/bridge/runs"
 import type { Engine, Event } from "../src/bridge/opencode"
+import type { RunView } from "../src/ui/view"
 
-const target = { sessionId: "ses_1", channelId: "thread_1", directory: "/work/a" }
+const target = { sessionId: "ses_1", channelId: "thread_1", directory: "/work/blog", meta: { model: "anthropic/claude-sonnet-4-6", branch: "thread/x", project: "blog" } }
 const text = (value: string): Pending => ({ parts: [{ type: "text", text: value }] })
 
-function harness(options: { autoApprove?: boolean; failPrompt?: string } = {}) {
+function harness(options: { autoApprove?: boolean; failPrompt?: string; failSteer?: boolean } = {}) {
   const log = {
     prompts: [] as Array<{ sessionId: string; parts: Pending["parts"] }>,
-    sent: [] as string[],
-    progress: [] as string[],
-    permissions: [] as string[],
-    permissionInfo: [] as Array<{ title: string; detail: string }>,
+    answers: [] as string[],
+    notices: [] as string[],
+    cards: [] as Array<{ id: string; edited: boolean; view: RunView }>,
+    permissions: [] as Array<{ id: string; tool: string; detail: string }>,
     approvals: [] as string[],
     aborted: [] as string[],
     typing: 0,
-    idle: [] as string[],
+    idle: [] as RunSummary[],
     statuses: {} as Record<string, { type: string }>,
   }
   const engine: Engine = {
     async promptAsync(input) {
-      if (options.failPrompt) throw new Error(options.failPrompt)
+      if (options.failPrompt || (options.failSteer && log.prompts.length > 0)) throw new Error(options.failPrompt ?? "steer rejected")
       log.prompts.push({ sessionId: input.sessionId, parts: input.parts })
     },
     async abort(sessionId) {
@@ -47,244 +48,327 @@ function harness(options: { autoApprove?: boolean; failPrompt?: string } = {}) {
     },
   }
   const surface: Surface = {
+    async showRun(_, view, messageId) {
+      log.cards.push({ id: messageId ?? "card_1", edited: !!messageId, view: structuredClone(view) })
+      return messageId ?? "card_1"
+    },
+    async sendAnswer(_, value) {
+      log.answers.push(value)
+    },
     async send(_, value) {
-      log.sent.push(value)
-    },
-    async createProgress(_, value) {
-      log.progress.push(`create:${value}`)
-      return "progress_1"
-    },
-    async editProgress(_, id, value) {
-      log.progress.push(`edit:${id}:${value}`)
+      log.notices.push(value)
     },
     typing() {
       log.typing += 1
     },
     async askPermission(_, permission) {
-      log.permissions.push(permission.id)
-      log.permissionInfo.push({ title: permission.title, detail: permission.detail })
+      log.permissions.push({ id: permission.id, tool: permission.tool, detail: permission.detail })
     },
   }
   let time = 1_000_000
-  const runs = new RunManager(engine, surface, {
-    autoApprove: options.autoApprove ?? false,
-    onIdle: (sessionId) => log.idle.push(sessionId),
-    now: () => time,
-  })
-  return { runs, log, advance: (ms: number) => (time += ms) }
+  const runs = new RunManager(engine, surface, { autoApprove: options.autoApprove ?? false, onIdle: (_, __, summary) => log.idle.push(summary), now: () => time })
+  const lastCard = () => log.cards.at(-1)!.view
+  return { runs, log, lastCard, advance: (ms: number) => (time += ms) }
 }
 
-const message = (id: string, role: "user" | "assistant", extra: object = {}) =>
-  ({ type: "message.updated", properties: { info: { id, sessionID: "ses_1", role, ...extra } } }) as unknown as Event
-
-const textPart = (id: string, messageID: string, value: string, done: boolean) =>
-  ({
-    type: "message.part.updated",
-    properties: { part: { id, sessionID: "ses_1", messageID, type: "text", text: value, time: done ? { start: 1, end: 2 } : { start: 1 } } },
-  }) as unknown as Event
-
-const toolPart = (callID: string, status: string, title = "") =>
-  ({
-    type: "message.part.updated",
-    properties: {
-      part: {
-        id: `part_${callID}`,
-        sessionID: "ses_1",
-        messageID: "a1",
-        type: "tool",
-        callID,
-        tool: "bash",
-        state: { status, input: { command: "ls" }, title, output: "", metadata: {}, time: { start: 1, end: 2 } },
-      },
-    },
-  }) as unknown as Event
-
-const status = (type: string) => ({ type: "session.status", properties: { sessionID: "ses_1", status: { type } } }) as unknown as Event
+const ev = (value: object) => value as unknown as Event
+const user = (id = "u1") => ev({ type: "message.updated", properties: { sessionID: "ses_1", info: { id, sessionID: "ses_1", role: "user" } } })
+const assistant = (id: string, extra: object = {}) =>
+  ev({ type: "message.updated", properties: { sessionID: "ses_1", info: { id, sessionID: "ses_1", role: "assistant", providerID: "anthropic", modelID: "claude-sonnet-4-6", ...extra } } })
+const textPart = (id: string, messageID: string, value: string, done = true) =>
+  ev({ type: "message.part.updated", properties: { sessionID: "ses_1", part: { id, sessionID: "ses_1", messageID, type: "text", text: value, time: done ? { start: 1, end: 2 } : { start: 1 } } } })
+const toolPart = (callID: string, state: object, tool = "bash", messageID = "a1") =>
+  ev({ type: "message.part.updated", properties: { sessionID: "ses_1", part: { id: `part_${callID}`, sessionID: "ses_1", messageID, type: "tool", callID, tool, state } } })
+const status = (type: string, extra: object = {}) => ev({ type: "session.status", properties: { sessionID: "ses_1", status: { type, ...extra } } })
 const idle = status("idle")
 const busy = status("busy")
+const settle = () => Bun.sleep(10)
 
-describe("RunManager", () => {
-  test("sends completed assistant text once, skips the user's own text, and goes idle", async () => {
-    const { runs, log } = harness()
-    expect(await runs.submit(target, text("hi"))).toBe("started")
-    expect(log.prompts).toHaveLength(1)
+describe("starting and finishing", () => {
+  test("a prompt starts a run: the agent is called at once and a live card appears", async () => {
+    const t = harness()
+    expect(await t.runs.submit(target, text("블로그 만들어줘"))).toBe("started")
+    await settle()
+    expect(t.log.prompts).toHaveLength(1)
+    expect(t.log.typing).toBeGreaterThan(0)
+    expect(t.log.cards[0].view).toMatchObject({ state: "running", model: "anthropic/claude-sonnet-4-6", branch: "thread/x", project: "blog", directory: "/work/blog" })
+    expect(t.runs.isBusy("ses_1")).toBe(true)
+  })
 
-    await runs.handle(message("u1", "user"))
-    await runs.handle(textPart("p_user", "u1", "hi", true))
-    await runs.handle(message("a1", "assistant"))
-    await runs.handle(textPart("p1", "a1", "Hel", false))
-    await runs.handle(textPart("p1", "a1", "Hello!", true))
-    await runs.handle(textPart("p1", "a1", "Hello!", true))
-    await runs.handle(idle)
+  test("the answer is its own message; the card ends as done, and a summary is reported", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("hi"))
+    await t.runs.handle(busy)
+    await t.runs.handle(user())
+    await t.runs.handle(textPart("p_user", "u1", "hi"))
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(textPart("p1", "a1", "Hel", false))
+    await t.runs.handle(textPart("p1", "a1", "Hello!"))
+    await t.runs.handle(assistant("a1", { finish: "stop" }))
+    await t.runs.handle(textPart("p1", "a1", "Hello!"))
+    await t.runs.handle(idle)
 
-    expect(log.sent).toEqual(["Hello!"])
-    expect(log.idle).toEqual(["ses_1"])
-    expect(runs.isBusy("ses_1")).toBe(false)
+    expect(t.log.answers).toEqual(["Hello!"])
+    expect(t.lastCard().state).toBe("done")
+    expect(t.runs.isBusy("ses_1")).toBe(false)
+    expect(t.log.idle).toHaveLength(1)
+    expect(t.log.idle[0]).toMatchObject({ state: "done", answer: "Hello!", tools: 0 })
+  })
+
+  test("text before a tool call is narration on the card, not a separate answer", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(textPart("p1", "a1", "먼저 파일 구조를 볼게요"))
+    await t.runs.handle(assistant("a1", { finish: "tool-calls" }))
+    await t.runs.handle(assistant("a2"))
+    await t.runs.handle(textPart("p2", "a2", "끝났어요"))
+    await t.runs.handle(assistant("a2", { finish: "stop" }))
+    await t.runs.handle(idle)
+    expect(t.log.answers).toEqual(["끝났어요"])
+    expect(t.lastCard().narration).toEqual(["먼저 파일 구조를 볼게요"])
   })
 
   test("a part that arrives before its message is held until the role is known", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("hi"))
-    await runs.handle(textPart("p_user", "u1", "hi", true))
-    await runs.handle(textPart("p1", "a1", "answer", true))
-    expect(log.sent).toEqual([])
-    await runs.handle(message("u1", "user"))
-    await runs.handle(message("a1", "assistant"))
-    await runs.handle(idle)
-    expect(log.sent).toEqual(["answer"])
+    const t = harness()
+    await t.runs.submit(target, text("hi"))
+    await t.runs.handle(busy)
+    await t.runs.handle(textPart("p_user", "u1", "hi"))
+    await t.runs.handle(textPart("p1", "a1", "answer"))
+    expect(t.log.answers).toEqual([])
+    await t.runs.handle(user())
+    await t.runs.handle(assistant("a1", { finish: "stop" }))
+    await t.runs.handle(idle)
+    expect(t.log.answers).toEqual(["answer"])
   })
 
-  test("text that never reported an end is flushed when the session goes idle", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("hi"))
-    await runs.handle(message("a1", "assistant"))
-    await runs.handle(textPart("p1", "a1", "partial but final", false))
-    await runs.handle(idle)
-    expect(log.sent).toEqual(["partial but final"])
+  test("text of a turn that never reported its end is still delivered when the agent goes idle", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("hi"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(textPart("p1", "a1", "partial but final", false))
+    await t.runs.handle(idle)
+    expect(t.log.answers).toEqual(["partial but final"])
   })
 
-  test("messages that arrive while busy are queued and sent together as one follow-up", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("first"))
-    expect(await runs.submit(target, text("second"))).toBe("queued")
-    expect(await runs.submit(target, text("third"))).toBe("queued")
-    expect(runs.queued("ses_1")).toBe(2)
-    expect(log.prompts).toHaveLength(1)
-
-    await runs.handle(busy)
-    await runs.handle(idle)
-    expect(log.prompts).toHaveLength(2)
-    expect(log.prompts[1].parts).toEqual([
-      { type: "text", text: "second" },
-      { type: "text", text: "third" },
-    ])
-    expect(runs.isBusy("ses_1")).toBe(true)
-    expect(log.idle).toEqual([])
+  test("an idle that arrives before any activity belongs to the previous turn and is ignored", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(idle)
+    expect(t.runs.isBusy("ses_1")).toBe(true)
+    await t.runs.handle(busy)
+    await t.runs.handle(idle)
+    expect(t.runs.isBusy("ses_1")).toBe(false)
   })
 
-  test("a message submitted while the run is finishing is queued, never started concurrently", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("first"))
-    await runs.handle(busy)
-    const finishing = runs.handle(idle)
-    const second = await runs.submit(target, text("second"))
+  test("the legacy session.idle event still ends a run", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(ev({ type: "session.idle", properties: { sessionID: "ses_1" } }))
+    expect(t.runs.isBusy("ses_1")).toBe(false)
+  })
+})
+
+describe("instructions while the agent is working", () => {
+  test("go to the agent immediately instead of waiting, and show on the card", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("first"))
+    await t.runs.handle(busy)
+    expect(await t.runs.submit(target, text("스타일은 어둡게"))).toBe("steered")
+    expect(await t.runs.submit(target, text("그리고 로고도"))).toBe("steered")
+    expect(t.log.prompts.map((item) => item.parts)).toEqual([[{ type: "text", text: "first" }], [{ type: "text", text: "스타일은 어둡게" }], [{ type: "text", text: "그리고 로고도" }]])
+    await settle()
+    expect(t.runs.view("ses_1")?.steered).toBe(2)
+    expect(t.runs.isBusy("ses_1")).toBe(true)
+  })
+
+  test("a rejected steering prompt is reported to the caller", async () => {
+    const t = harness({ failSteer: true })
+    await t.runs.submit(target, text("first"))
+    await t.runs.handle(busy)
+    await expect(t.runs.submit(target, text("more"))).rejects.toThrow("steer rejected")
+    expect(t.runs.view("ses_1")?.steered).toBe(0)
+  })
+
+  test("a prompt that arrives while the run is closing starts a new run instead of joining the finished one", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("first"))
+    await t.runs.handle(busy)
+    const finishing = t.runs.handle(idle)
+    const second = t.runs.submit(target, text("second"))
     await finishing
-    expect(second).toBe("queued")
-    expect(log.prompts.map((item) => item.parts)).toEqual([[{ type: "text", text: "first" }], [{ type: "text", text: "second" }]])
+    expect(await second).toBe("started")
+    expect(t.log.prompts).toHaveLength(2)
+    expect(t.runs.view("ses_1")).toMatchObject({ state: "running", steered: 0 })
   })
 
-  test("tool activity is shown as one progress message that is edited, then finalised", async () => {
-    const { runs, log, advance } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle(message("a1", "assistant"))
-    await runs.handle(toolPart("c1", "running"))
-    await Bun.sleep(5)
-    advance(5_000)
-    await runs.handle(toolPart("c1", "completed", "ls -la"))
-    await runs.handle(idle)
+  test("work that starts on its own (a prompt that raced the end of the last run) gets a card instead of vanishing", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("first"))
+    await t.runs.handle(busy)
+    await t.runs.handle(idle)
+    expect(t.runs.isBusy("ses_1")).toBe(false)
+    await t.runs.handle(busy)
+    expect(t.runs.isBusy("ses_1")).toBe(true)
+    await t.runs.handle(assistant("a9"))
+    await t.runs.handle(textPart("p9", "a9", "late answer"))
+    await t.runs.handle(assistant("a9", { finish: "stop" }))
+    await t.runs.handle(idle)
+    expect(t.log.answers).toEqual(["late answer"])
+  })
+})
 
-    expect(log.progress[0]).toStartWith("create:")
-    expect(log.progress.some((item) => item.startsWith("edit:progress_1:"))).toBe(true)
-    const last = log.progress[log.progress.length - 1]
-    expect(last).toContain("✅ 작업 완료 · 도구 1회")
-    expect(last).toContain("ls -la")
+describe("the live card", () => {
+  test("tool calls appear with their state, timing, files and diff stats", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(toolPart("c1", { status: "running", input: { command: "npm test" }, time: { start: 1000 } }))
+    await t.runs.handle(toolPart("c1", { status: "completed", input: { command: "npm test" }, output: "ok", title: "", metadata: { exit: 0 }, time: { start: 1000, end: 4200 } }))
+    await t.runs.handle(
+      toolPart("c2", {
+        status: "completed",
+        input: { filePath: "/work/blog/src/a.ts" },
+        output: "ok",
+        title: "src/a.ts",
+        metadata: { filediff: { file: "src/a.ts", additions: 12, deletions: 3 } },
+        time: { start: 5000, end: 5100 },
+      }, "edit"),
+    )
+    await t.runs.handle(idle)
+    const tools = t.lastCard().tools
+    expect(tools).toHaveLength(2)
+    expect(tools[0]).toMatchObject({ tool: "bash", status: "completed", started: 1000, ended: 4200 })
+    expect(tools[1]).toMatchObject({ tool: "edit", file: "/work/blog/src/a.ts", additions: 12, deletions: 3 })
+    expect(t.log.idle[0].files).toEqual(["/work/blog/src/a.ts"])
   })
 
-  test("provider errors are reported to the thread, aborts are not", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle({ type: "session.error", properties: { sessionID: "ses_1", error: { name: "MessageAbortedError", data: { message: "x" } } } } as unknown as Event)
-    await runs.handle(idle)
-    expect(log.sent).toEqual([])
-
-    await runs.submit(target, text("again"))
-    await runs.handle({ type: "session.error", properties: { sessionID: "ses_1", error: { name: "ProviderAuthError", data: { message: "bad key" } } } } as unknown as Event)
-    await runs.handle(idle)
-    expect(log.sent).toEqual(["⚠️ ProviderAuthError: bad key"])
+  test("a command that exits non-zero shows as failed with the tail of its output", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(toolPart("c1", { status: "completed", input: { command: "npm run build" }, output: "line1\nline2\nError: boom", title: "", metadata: { exit: 1 }, time: { start: 1, end: 2 } }))
+    await t.runs.handle(toolPart("c2", { status: "error", input: { command: "x" }, error: "command not found", time: { start: 1, end: 2 } }))
+    await t.runs.handle(idle)
+    const [first, second] = t.lastCard().tools
+    expect(first).toMatchObject({ status: "error", exit: 1, tail: "line1\nline2\nError: boom" })
+    expect(second).toMatchObject({ status: "error", tail: "command not found" })
   })
 
-  test("a failed prompt start is reported and the session is usable again", async () => {
-    const { runs, log } = harness({ failPrompt: "server down" })
-    await runs.submit(target, text("go"))
-    expect(log.sent).toEqual(["⚠️ server down"])
-    expect(runs.isBusy("ses_1")).toBe(false)
+  test("todo updates, token usage and cost are tracked", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(ev({ type: "todo.updated", properties: { sessionID: "ses_1", todos: [{ content: "빌드", status: "completed" }, { content: "배포", status: "in_progress" }, { content: "?", status: "weird" }] } }))
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(ev({ type: "message.part.updated", properties: { sessionID: "ses_1", part: { id: "s1", sessionID: "ses_1", messageID: "a1", type: "step-finish", reason: "stop", cost: 0.01, tokens: { input: 1000, output: 200, reasoning: 50, cache: { read: 300, write: 100 } } } } }))
+    await t.runs.handle(ev({ type: "message.part.updated", properties: { sessionID: "ses_1", part: { id: "s1", sessionID: "ses_1", messageID: "a1", type: "step-finish", reason: "stop", cost: 0.01, tokens: { input: 1000, output: 200, reasoning: 50, cache: { read: 300, write: 100 } } } } }))
+    await t.runs.handle(ev({ type: "message.part.updated", properties: { sessionID: "ses_1", part: { id: "s2", sessionID: "ses_1", messageID: "a1", type: "step-finish", reason: "stop", cost: 0.02, tokens: { input: 500, output: 100, reasoning: 0, cache: { read: 0, write: 0 } } } } }))
+    await t.runs.handle(idle)
+    const view = t.lastCard()
+    expect(view.todos.map((todo) => todo.status)).toEqual(["completed", "in_progress", "pending"])
+    expect(view.tokens).toEqual({ input: 1500, output: 350, cache: 400 })
+    expect(view.cost).toBeCloseTo(0.03)
   })
 
-  test("permission requests go to Discord, or are approved automatically", async () => {
+  test("card edits are throttled but the first card and the final card always go out", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await settle()
+    const before = t.log.cards.length
+    for (let index = 0; index < 20; index++) await t.runs.handle(toolPart(`c${index}`, { status: "completed", input: { command: `c${index}` }, output: "", title: "", metadata: {}, time: { start: 1, end: 2 } }))
+    await settle()
+    expect(t.log.cards.length - before).toBeLessThanOrEqual(1)
+    expect(t.log.cards.every((card, index) => index === 0 || card.edited)).toBe(true)
+    await t.runs.handle(idle)
+    expect(t.lastCard().tools).toHaveLength(20)
+    expect(t.lastCard().state).toBe("done")
+  })
+})
+
+describe("failures, stops and moves", () => {
+  test("provider errors end the card as failed with the reason", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(ev({ type: "session.error", properties: { sessionID: "ses_1", error: { name: "ProviderAuthError", data: { message: "bad key" } } } }))
+    await t.runs.handle(idle)
+    expect(t.lastCard()).toMatchObject({ state: "failed", failure: "ProviderAuthError: bad key" })
+  })
+
+  test("stopping ends the card as stopped and an abort error is not a failure", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    expect(await t.runs.abort("ses_1")).toBe(true)
+    expect(t.log.aborted).toEqual(["ses_1"])
+    await t.runs.handle(ev({ type: "session.error", properties: { sessionID: "ses_1", error: { name: "MessageAbortedError", data: { message: "x" } } } }))
+    await t.runs.handle(idle)
+    expect(t.lastCard()).toMatchObject({ state: "stopped" })
+    expect(t.lastCard().failure).toBeUndefined()
+    expect(await t.runs.abort("ses_1")).toBe(false)
+  })
+
+  test("a prompt that cannot be started fails the card and frees the session", async () => {
+    const t = harness({ failPrompt: "server down" })
+    await t.runs.submit(target, text("go"))
+    expect(t.lastCard()).toMatchObject({ state: "failed", failure: "server down" })
+    expect(t.runs.isBusy("ses_1")).toBe(false)
+  })
+
+  test("moving the thread to another session closes the card as moved", async () => {
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.moveAway("ses_1")
+    expect(t.lastCard().state).toBe("moved")
+    expect(t.log.aborted).toEqual(["ses_1"])
+    expect(t.runs.view("ses_1")).toBeUndefined()
+  })
+})
+
+describe("permissions and housekeeping", () => {
+  test("permission requests go to Discord with the tool and patterns, or are approved automatically", async () => {
     const asking = harness()
     await asking.runs.submit(target, text("go"))
-    await asking.runs.handle({ type: "permission.asked", properties: { id: "per_1", sessionID: "ses_1", permission: "bash", patterns: ["rm -rf build"], metadata: {}, always: [] } } as unknown as Event)
-    expect(asking.log.permissions).toEqual(["per_1"])
+    await asking.runs.handle(ev({ type: "permission.asked", properties: { id: "per_1", sessionID: "ses_1", permission: "bash", patterns: ["rm -rf build", "ls"], metadata: {}, always: [] } }))
+    expect(asking.log.permissions).toEqual([{ id: "per_1", tool: "bash", detail: "rm -rf build, ls" }])
     expect(asking.log.approvals).toEqual([])
 
     const auto = harness({ autoApprove: true })
     await auto.runs.submit(target, text("go"))
-    await auto.runs.handle({ type: "permission.asked", properties: { id: "per_2", sessionID: "ses_1", permission: "bash", patterns: ["ls"], metadata: {}, always: [] } } as unknown as Event)
+    await auto.runs.handle(ev({ type: "permission.asked", properties: { id: "per_2", sessionID: "ses_1", permission: "bash", patterns: ["ls"], metadata: {}, always: [] } }))
     expect(auto.log.approvals).toEqual(["per_2:once"])
-    expect(auto.log.permissions).toEqual([])
-  })
-
-  test("abort clears the queue and asks the server to stop", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("first"))
-    await runs.submit(target, text("second"))
-    expect(await runs.abort("ses_1")).toBe(true)
-    expect(log.aborted).toEqual(["ses_1"])
-    expect(runs.queued("ses_1")).toBe(0)
-    expect(await runs.abort("unknown")).toBe(false)
   })
 
   test("reconcile finishes a run whose idle event was missed, but leaves a running one alone", async () => {
-    const { runs, log, advance } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle(message("a1", "assistant"))
-    await runs.handle(textPart("p1", "a1", "done", true))
-
-    advance(30_000)
-    log.statuses = { ses_1: { type: "busy" } }
-    await runs.reconcile()
-    expect(runs.isBusy("ses_1")).toBe(true)
-
-    log.statuses = {}
-    await runs.reconcile()
-    expect(runs.isBusy("ses_1")).toBe(false)
-    expect(log.sent).toEqual(["done"])
-  })
-
-  test("an idle status that arrives before any activity belongs to the previous turn and is ignored", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle(idle)
-    expect(runs.isBusy("ses_1")).toBe(true)
-
-    await runs.handle(busy)
-    await runs.handle(idle)
-    expect(runs.isBusy("ses_1")).toBe(false)
-    expect(log.idle).toEqual(["ses_1"])
-  })
-
-  test("the legacy session.idle event still ends a run that showed activity", async () => {
-    const { runs } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle(busy)
-    await runs.handle({ type: "session.idle", properties: { sessionID: "ses_1" } } as unknown as Event)
-    expect(runs.isBusy("ses_1")).toBe(false)
-  })
-
-  test("the permission prompt carries the tool name and the patterns", async () => {
-    const { runs, log } = harness()
-    await runs.submit(target, text("go"))
-    await runs.handle({
-      type: "permission.asked",
-      properties: { id: "per_9", sessionID: "ses_1", permission: "bash", patterns: ["rm -rf build", "ls"], metadata: {}, always: [] },
-    } as unknown as Event)
-    expect(log.permissionInfo).toEqual([{ title: "bash", detail: "rm -rf build, ls" }])
+    const t = harness()
+    await t.runs.submit(target, text("go"))
+    await t.runs.handle(busy)
+    await t.runs.handle(assistant("a1"))
+    await t.runs.handle(textPart("p1", "a1", "done"))
+    t.advance(30_000)
+    t.log.statuses = { ses_1: { type: "busy" } }
+    await t.runs.reconcile()
+    expect(t.runs.isBusy("ses_1")).toBe(true)
+    t.log.statuses = {}
+    await t.runs.reconcile()
+    expect(t.runs.isBusy("ses_1")).toBe(false)
+    expect(t.log.answers).toEqual(["done"])
   })
 
   test("events for unknown sessions are ignored", async () => {
-    const { runs, log } = harness()
-    await runs.handle(textPart("p1", "a1", "stray", true))
-    await runs.handle(idle)
-    expect(log.sent).toEqual([])
+    const t = harness()
+    await t.runs.handle(textPart("p1", "a1", "stray"))
+    await t.runs.handle(idle)
+    expect(t.log.answers).toEqual([])
+    expect(t.log.cards).toEqual([])
   })
 })

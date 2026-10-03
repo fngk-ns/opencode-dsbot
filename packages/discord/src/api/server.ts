@@ -8,6 +8,7 @@ import type { MemoryStore } from "../memory/store"
 import type { ServiceManager } from "../services/manager"
 import { memoryRoute } from "./memory-routes"
 import { reply, type ApiContext } from "./shared"
+import { projectRoute, type ProjectDeps } from "./project-routes"
 import { serviceRoute, type ServiceDeps } from "./service-routes"
 import { adminRoute, type AdminRouteDeps } from "./admin-routes"
 import { threadRoute, type ThreadDeps } from "./thread-routes"
@@ -16,7 +17,7 @@ export type Lookup = ReturnType<typeof createLookup>
 
 export type { ApiContext } from "./shared"
 
-export type ApiDeps = AdminRouteDeps & ThreadDeps & Pick<ServiceDeps, "confirmServices"> & {
+export type ApiDeps = AdminRouteDeps & ThreadDeps & ProjectDeps & Pick<ServiceDeps, "confirmServices" | "announceService"> & {
   token: string
   memory: MemoryStore
   services: ServiceManager
@@ -98,6 +99,7 @@ export function createApiHandler(deps: ApiDeps) {
     if (route === "/services") return serviceRoute(deps, context, body)
     if (route === "/admin") return adminRoute(deps, context, body)
     if (route === "/threads") return threadRoute(deps, context, body)
+    if (route === "/projects") return projectRoute(deps, context, body)
     return reply(404, { ok: false, error: "not found" })
   }
 }

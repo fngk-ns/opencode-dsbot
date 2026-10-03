@@ -13,10 +13,14 @@ import { createLookup } from "./cache/lookup"
 import { loadConfig } from "./config"
 import { CompactionManager } from "./memory/compaction"
 import { MemoryStore } from "./memory/store"
+import { ProjectManager } from "./projects/manager"
+import { ProjectStore } from "./projects/store"
+import { HOME_DIR, switchToProject } from "./projects/switch"
 import { ServiceManager } from "./services/manager"
 import { detectPublicHost } from "./services/public-host"
 import { ServiceStore } from "./services/store"
 import { branchThread, projectDir, type DiscordThreads } from "./threads/branch"
+import { projectCard } from "./ui/cards"
 import { createClient } from "./discord/client"
 import { editPatch, toStored } from "./discord/record"
 import { createGuildPort } from "./discord/guild-port"
@@ -39,6 +43,8 @@ const kv = new KeyValueStore(db)
 const memory = new MemoryStore(db)
 const auditLog = new AuditLog(db)
 const pending = new PendingActions()
+const projects = new ProjectStore(db)
+const projectManager = new ProjectManager({ store: projects, workspaceDir: config.workspaceDir, memory })
 
 const client = createClient()
 const warmer = new MemberWarmer(client)
@@ -110,6 +116,25 @@ const branchDeps = () => ({
   kickoff: (binding: Parameters<typeof router.promptThread>[0], text: string, authorId: string) => router.promptThread(binding, text, authorId),
 })
 
+const switchDeps = () => ({
+  engine,
+  bindings,
+  memory,
+  kv,
+  workspaceDir: config.workspaceDir,
+  branchPerThread: config.branchPerThread,
+  moveAway: (sessionId: string) => runs.moveAway(sessionId),
+  prompt: (binding: Parameters<typeof router.promptThread>[0], text: string, authorId: string) => router.promptThread(binding, text, authorId),
+  announce: async (channelId: string, input: Parameters<typeof projectCard>[0]) => void (await surface.sendCard(channelId, projectCard(input))),
+})
+
+/** The project a thread works in: null in the workspace home, and "self" for the bot's own code. */
+function projectOfBinding(binding: { kind: string; directory: string }) {
+  if (binding.kind === "self") return "self"
+  const name = projectDir(config.workspaceDir, binding.directory)
+  return name === HOME_DIR || name.startsWith("..") ? null : name
+}
+
 const admin = new AdminActions({
   guild: (guildId) => createGuildPort(client, guildId, directory),
   messages,
@@ -126,8 +151,18 @@ const api = startApi({
   lookup,
   memory,
   services,
+  announceService: (context, deployed) => surface.showService(context.channelId, { ...deployed, localUrl: deployed.local_url }),
+  projects,
+  manager: projectManager,
+  serviceSummaries: () => services.summaries(),
+  async moveThread(context, name, created) {
+    const binding = bindings.get(context.channelId)
+    const project = projects.get(name)
+    if (!binding || !project) return { ok: false, error: "unknown thread or project" }
+    return switchToProject(switchDeps(), { binding, project, created, speakerId: context.speakerId ?? binding.owner_id })
+  },
   confirmServices:
-    config.permissionMode === "ask"
+    config.deployConfirm === "ask"
       ? async (context, description, run) => {
           const id = pending.add({ description, actorId: context.speakerId ?? "", channelId: context.channelId, run })
           await surface.askAdminConfirm(context.channelId, id, description)
@@ -155,7 +190,9 @@ const api = startApi({
       channelId: binding.channel_id,
       guildId: channel && "guildId" in channel ? channel.guildId : null,
       directory: binding.directory,
-      project: binding.kind === "self" ? "self" : projectDir(config.workspaceDir, binding.directory),
+      project: projectOfBinding(binding),
+      trunk: projects.get(projectOfBinding(binding) ?? "")?.directory ?? (binding.kind === "self" ? config.selfDir : null),
+      branch: memory.thread(binding.channel_id)?.branch ?? null,
       kind: binding.kind,
       speakerId: speakers.get(sessionId) ?? null,
     }
@@ -210,8 +247,12 @@ void opencode.exited.then((code) => {
 const engine = createEngine(opencode.client)
 const runs = new RunManager(engine, surface, {
   autoApprove: config.permissionMode === "auto",
-  // A quiet moment with nothing queued is the safe time to compact a long conversation.
-  onIdle: (sessionId) => void compaction.afterIdle(sessionId).catch(logError("compaction")),
+  // A quiet moment is the safe time to compact a long conversation; the project's last-touched thread is also kept current.
+  onIdle: (sessionId, channelId, summary) => {
+    void compaction.afterIdle(sessionId).catch(logError("compaction"))
+    const project = projectOfBinding(bindings.get(channelId) ?? { kind: "project", directory: config.workspaceDir })
+    if (project && project !== "self" && summary.state === "done") projects.update(project, { last_thread: channelId })
+  },
 })
 let catalog: { at: number; models: Awaited<ReturnType<typeof engine.models>> } | undefined
 const compaction = new CompactionManager({
@@ -252,7 +293,14 @@ const router = createRouter({
   surface,
   memory,
   services,
+  projects,
+  projectManager,
   pending,
+  async enterProject(binding, name, speakerId) {
+    const project = projects.get(name)
+    if (!project) return { ok: false, error: `unknown project ${name}` }
+    return switchToProject(switchDeps(), { binding, project, created: false, speakerId })
+  },
   branch: (binding, input) => branchThread(branchDeps(), { from: binding, ...input }),
   restartNow,
 })

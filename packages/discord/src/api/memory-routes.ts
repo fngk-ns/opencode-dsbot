@@ -43,14 +43,15 @@ export function memoryRoute(deps: MemoryDeps, context: ApiContext, raw: unknown)
   const scopeName = (scope: z.infer<typeof scopes>) => {
     if (scope === "global") return "global"
     if (scope === "guild") return context.guildId ? `guild:${context.guildId}` : undefined
-    if (scope === "project") return `project:${context.project}`
+    if (scope === "project") return context.project ? `project:${context.project}` : undefined
     return `thread:${context.channelId}`
   }
   const shared = (scope: string) => scope === "global" || scope.startsWith("guild:")
 
   if (input.action === "save") {
-    const scope = scopeName(input.scope ?? "project")
-    if (!scope) return reply(200, { ok: false, error: "there is no server in a DM; use scope project or thread" })
+    // Without an explicit scope, notes belong to the project, or to this thread when it is not in a project.
+    const scope = scopeName(input.scope ?? (context.project ? "project" : "thread"))
+    if (!scope) return reply(200, { ok: false, error: "that scope does not exist here (no server in a DM, or this thread is not in a project)" })
     if (shared(scope) && !owner) return reply(200, { ok: false, error: "only an owner can save to the shared (global/server) memory; use scope project or thread" })
     if (!input.title || !input.body) return reply(200, { ok: false, error: "title and body are required" })
     const entry = deps.memory.save({

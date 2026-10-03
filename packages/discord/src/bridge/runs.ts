@@ -1,6 +1,6 @@
-import type { Part, ToolState } from "@opencode-ai/sdk/v2/client"
+import type { Part, ToolPart } from "@opencode-ai/sdk/v2/client"
+import type { RunMeta, RunView, TodoEntry, ToolEntry } from "../ui/view"
 import type { Engine, Event } from "./opencode"
-import type { OutFile } from "../discord/outbound"
 
 export type PromptPart = Parameters<Engine["promptAsync"]>[0]["parts"][number]
 
@@ -13,47 +13,59 @@ export type Pending = {
 
 /** Everything the run manager needs from Discord. The real implementation lives in discord/surface.ts. */
 export type Surface = {
-  send(channelId: string, text: string, files?: OutFile[]): Promise<void>
-  createProgress(channelId: string, text: string): Promise<string>
-  editProgress(channelId: string, messageId: string, text: string): Promise<void>
+  /** Creates the run card, or edits it when `messageId` is given. Returns the message id. */
+  showRun(channelId: string, view: RunView, messageId?: string): Promise<string>
+  /** A final answer, rendered as its own message. */
+  sendAnswer(channelId: string, text: string): Promise<void>
+  send(channelId: string, text: string): Promise<void>
   typing(channelId: string): void
-  askPermission(channelId: string, permission: { sessionId: string; id: string; title: string; detail: string }): Promise<void>
+  askPermission(channelId: string, permission: { sessionId: string; id: string; tool: string; detail: string }): Promise<void>
 }
 
-type ToolLine = { tool: string; status: "pending" | "running" | "completed" | "error"; label: string }
+/** What a finished run did, for the thread journal and the project's history. */
+export type RunSummary = {
+  state: RunView["state"]
+  tools: number
+  files: string[]
+  steered: number
+  elapsedMs: number
+  answer: string
+}
+
+export type Target = { sessionId: string; channelId: string; directory: string; meta?: RunMeta }
+
+type Message = { role: "user" | "assistant"; finish?: string; texts: Map<string, { text: string; done: boolean; sent: boolean }> }
 
 type Run = {
-  sessionId: string
-  channelId: string
-  directory: string
+  target: Target
+  view: RunView
   busy: boolean
-  finishing: boolean
+  finishing?: Promise<void>
+  aborted: boolean
   seenActivity: boolean
-  queue: Pending[]
-  roles: Map<string, "user" | "assistant">
+  messages: Map<string, Message>
   stash: Map<string, Part[]>
-  texts: Map<string, { text: string; delivered: boolean }>
-  tools: Map<string, ToolLine>
-  toolCount: number
-  progressId?: string
-  progressShown: string
-  progressDirty: boolean
-  lastEdit: number
-  failure?: string
-  retryNote?: string
+  steps: Map<string, { input: number; output: number; cache: number; cost: number }>
+  answers: string[]
+  cardId?: string
+  cardShown: string
+  cardDirty: boolean
+  lastCard: number
   lastEventAt: number
   outbox: Promise<void>
   typingTimer?: ReturnType<typeof setInterval>
-  progressTimer?: ReturnType<typeof setTimeout>
+  cardTimer?: ReturnType<typeof setTimeout>
 }
 
-const PROGRESS_INTERVAL_MS = 2_000
-const PROGRESS_LINES = 8
+const CARD_INTERVAL_MS = 1_500
 const STALE_AFTER_MS = 20_000
+// A model turn that ends in a tool call is narration on the way to the answer; any other ending is the answer itself.
+const CONTINUES = new Set(["tool-calls", "unknown"])
 
 /**
- * Drives opencode sessions on behalf of Discord threads: starts prompts, queues follow-ups while a session is busy,
- * streams text and tool activity back to the thread, and relays permission requests.
+ * Drives opencode sessions on behalf of Discord threads. Prompts go to the agent immediately, even while it is working:
+ * opencode folds them into the running loop at the next step. Progress is shown as one live card per run, the agent's
+ * answers arrive as their own messages, and permission requests are relayed to Discord.
  */
 export class RunManager {
   private readonly runs = new Map<string, Run>()
@@ -63,7 +75,7 @@ export class RunManager {
     private readonly surface: Surface,
     private readonly options: {
       autoApprove: boolean
-      onIdle?: (sessionId: string, channelId: string) => void
+      onIdle?: (sessionId: string, channelId: string, summary: RunSummary) => void
       now?: () => number
     },
   ) {}
@@ -76,28 +88,46 @@ export class RunManager {
     return this.runs.get(sessionId)?.busy ?? false
   }
 
-  queued(sessionId: string) {
-    return this.runs.get(sessionId)?.queue.length ?? 0
+  view(sessionId: string) {
+    return this.runs.get(sessionId)?.view
   }
 
-  /** Starts the prompt, or queues it behind the one that is running. */
-  async submit(target: { sessionId: string; channelId: string; directory: string }, pending: Pending) {
+  /**
+   * Hands the prompt to the agent right away. If it is already working the prompt joins the current run ("steered");
+   * otherwise it starts a new run. Throws when opencode rejects a steering prompt.
+   */
+  async submit(target: Target, pending: Pending) {
     const run = this.runFor(target)
+    if (run.finishing) await run.finishing
     if (run.busy) {
-      run.queue.push(pending)
-      return "queued" as const
+      await this.engine.promptAsync({ sessionId: run.target.sessionId, directory: run.target.directory, ...pending })
+      run.view.steered += 1
+      this.scheduleCard(run)
+      return "steered" as const
     }
     await this.start(run, pending)
     return "started" as const
   }
 
+  /** Stops the agent. The card ends as "stopped" rather than "done". */
   async abort(sessionId: string) {
     const run = this.runs.get(sessionId)
-    if (!run) return false
-    const dropped = run.queue.length
-    run.queue.length = 0
-    if (run.busy) await this.engine.abort(sessionId, run.directory).catch(() => undefined)
-    return run.busy || dropped > 0
+    if (!run?.busy) return false
+    run.aborted = true
+    await this.engine.abort(sessionId, run.target.directory).catch(() => undefined)
+    return true
+  }
+
+  /** The thread moved to another session (a new project, say): close this run's card and stop tracking it. */
+  async moveAway(sessionId: string) {
+    const run = this.runs.get(sessionId)
+    if (!run) return
+    if (run.busy) await this.engine.abort(sessionId, run.target.directory).catch(() => undefined)
+    run.view.state = "moved"
+    run.view.endedAt = this.now()
+    this.clearTimers(run)
+    await this.flushCard(run).catch(report("card"))
+    this.runs.delete(sessionId)
   }
 
   forget(sessionId: string) {
@@ -107,13 +137,13 @@ export class RunManager {
     this.runs.delete(sessionId)
   }
 
-  /** Safety net for a missed `session.idle`: asks the server whether quiet runs are really still running. */
+  /** Safety net for a missed idle event: asks the server whether quiet runs are really still running. */
   async reconcile() {
     for (const run of [...this.runs.values()]) {
-      if (!run.busy || this.now() - run.lastEventAt < STALE_AFTER_MS) continue
-      const statuses = await this.engine.status(run.directory).catch(() => undefined)
+      if (!run.busy || run.finishing || this.now() - run.lastEventAt < STALE_AFTER_MS) continue
+      const statuses = await this.engine.status(run.target.directory).catch(() => undefined)
       if (!statuses) continue
-      const status = statuses[run.sessionId]
+      const status = statuses[run.target.sessionId]
       if (!status || status.type === "idle") await this.finish(run)
     }
   }
@@ -121,35 +151,32 @@ export class RunManager {
   async handle(event: Event) {
     if (event.type === "message.updated") return this.onMessage(event.properties.info)
     if (event.type === "message.part.updated") return this.onPart(event.properties.part)
+    if (event.type === "todo.updated") return this.onTodos(event.properties.sessionID, event.properties.todos)
     if (event.type === "permission.asked") return this.onPermission(event.properties)
     if (event.type === "session.status") return this.onStatus(event.properties.sessionID, event.properties.status)
     if (event.type === "session.error") return this.onError(event.properties.sessionID, event.properties.error)
     if (event.type === "session.idle") return this.onStatus(event.properties.sessionID, { type: "idle" })
   }
 
-  private runFor(target: { sessionId: string; channelId: string; directory: string }) {
+  private runFor(target: Target) {
     const existing = this.runs.get(target.sessionId)
     if (existing) {
-      existing.channelId = target.channelId
-      existing.directory = target.directory
+      existing.target = { ...existing.target, ...target, meta: target.meta ?? existing.target.meta }
       return existing
     }
     const run: Run = {
-      sessionId: target.sessionId,
-      channelId: target.channelId,
-      directory: target.directory,
+      target,
+      view: this.freshView(target),
       busy: false,
-      finishing: false,
+      aborted: false,
       seenActivity: false,
-      queue: [],
-      roles: new Map(),
+      messages: new Map(),
       stash: new Map(),
-      texts: new Map(),
-      tools: new Map(),
-      toolCount: 0,
-      progressShown: "",
-      progressDirty: false,
-      lastEdit: 0,
+      steps: new Map(),
+      answers: [],
+      cardShown: "",
+      cardDirty: false,
+      lastCard: 0,
       lastEventAt: this.now(),
       outbox: Promise.resolve(),
     }
@@ -157,56 +184,73 @@ export class RunManager {
     return run
   }
 
-  private async start(run: Run, pending: Pending) {
-    run.busy = true
-    run.seenActivity = false
-    run.roles.clear()
-    run.texts.clear()
-    run.tools.clear()
-    run.stash.clear()
-    run.toolCount = 0
-    run.progressId = undefined
-    run.progressShown = ""
-    run.progressDirty = false
-    run.failure = undefined
-    run.retryNote = undefined
-    run.lastEventAt = this.now()
-    this.surface.typing(run.channelId)
-    run.typingTimer = setInterval(() => this.surface.typing(run.channelId), 8_000)
+  private freshView(target: Target): RunView {
+    return { ...target.meta, directory: target.directory, state: "running", sessionId: target.sessionId, startedAt: this.now(), tools: [], narration: [], todos: [], steered: 0 }
+  }
 
+  private async start(run: Run, pending: Pending) {
+    this.begin(run)
     const failure = await this.engine
-      .promptAsync({ sessionId: run.sessionId, directory: run.directory, ...pending })
+      .promptAsync({ sessionId: run.target.sessionId, directory: run.target.directory, ...pending })
       .then(() => undefined)
       .catch((error: unknown) => (error instanceof Error ? error.message : String(error)))
     if (failure === undefined) return
-    run.failure = failure
+    run.view.failure = failure
     await this.finish(run)
   }
 
-  private async onMessage(info: { id: string; sessionID: string; role: string; error?: { name: string; data?: unknown } }) {
+  /** Resets per-run state and puts up a fresh card. */
+  private begin(run: Run) {
+    run.busy = true
+    run.aborted = false
+    run.seenActivity = false
+    run.messages.clear()
+    run.stash.clear()
+    run.steps.clear()
+    run.answers = []
+    run.cardId = undefined
+    run.cardShown = ""
+    run.view = this.freshView(run.target)
+    run.lastEventAt = this.now()
+    this.surface.typing(run.target.channelId)
+    run.typingTimer = setInterval(() => this.surface.typing(run.target.channelId), 8_000)
+    this.scheduleCard(run, true)
+  }
+
+  private onMessage(info: { id: string; sessionID: string; role: string; finish?: string; error?: { name: string; data?: unknown }; providerID?: string; modelID?: string }) {
     const run = this.runs.get(info.sessionID)
-    if (!run) return
+    if (!run?.busy) return
     run.lastEventAt = this.now()
     run.seenActivity = true
     if (info.role !== "user" && info.role !== "assistant") return
-    run.roles.set(info.id, info.role)
-    if (info.role === "assistant" && info.error && info.error.name !== "MessageAbortedError")
-      run.failure = describeError(info.error)
+
+    const message: Message = run.messages.get(info.id) ?? { role: info.role, texts: new Map() }
+    message.role = info.role
+    message.finish = info.finish ?? message.finish
+    run.messages.set(info.id, message)
+    if (info.role !== "assistant") return
+
+    if (!run.view.model && info.providerID && info.modelID) run.view.model = `${info.providerID}/${info.modelID}`
+    if (info.error && info.error.name !== "MessageAbortedError") run.view.failure = describeError(info.error)
+
     const stashed = run.stash.get(info.id)
-    if (!stashed) return
-    run.stash.delete(info.id)
-    if (info.role === "assistant") for (const part of stashed) await this.onPart(part)
+    if (stashed) {
+      run.stash.delete(info.id)
+      for (const part of stashed) this.onPart(part)
+    }
+    if (message.finish) this.settle(run, info.id)
+    this.scheduleCard(run)
   }
 
-  private async onPart(part: Part) {
+  private onPart(part: Part) {
     const run = this.runs.get(part.sessionID)
     if (!run?.busy) return
     run.lastEventAt = this.now()
     run.seenActivity = true
 
-    const role = run.roles.get(part.messageID)
-    if (role === "user") return
-    if (role === undefined) {
+    const message = run.messages.get(part.messageID)
+    if (message?.role === "user") return
+    if (!message) {
       // The part arrived before its message; hold it until we know whose message it is.
       run.stash.set(part.messageID, [...(run.stash.get(part.messageID) ?? []).filter((item) => item.id !== part.id), part])
       return
@@ -214,18 +258,60 @@ export class RunManager {
 
     if (part.type === "text") {
       if (part.synthetic || part.ignored) return
-      const entry = run.texts.get(part.id) ?? { text: "", delivered: false }
+      const entry = message.texts.get(part.id) ?? { text: "", done: false, sent: false }
       entry.text = part.text
-      run.texts.set(part.id, entry)
-      if (part.time?.end) this.deliverText(run, part.id)
+      entry.done = !!part.time?.end
+      message.texts.set(part.id, entry)
+      // A message that already ended as an answer sends each text as soon as it completes.
+      if (entry.done && message.finish && !CONTINUES.has(message.finish)) this.settle(run, part.messageID)
       return
     }
 
     if (part.type === "tool") {
-      if (!run.tools.has(part.callID)) run.toolCount += 1
-      run.tools.set(part.callID, { tool: part.tool, status: part.state.status, label: toolLabel(part.state) })
-      this.scheduleProgress(run)
+      this.upsertTool(run, part)
+      this.scheduleCard(run)
+      return
     }
+
+    if (part.type === "step-finish") {
+      run.steps.set(part.id, { input: part.tokens.input, output: part.tokens.output + part.tokens.reasoning, cache: part.tokens.cache.read + part.tokens.cache.write, cost: part.cost })
+      const all = [...run.steps.values()]
+      run.view.tokens = { input: sum(all, "input"), output: sum(all, "output"), cache: sum(all, "cache") }
+      run.view.cost = sum(all, "cost")
+    }
+  }
+
+  /** A model turn ended: its text is an answer if the turn ended the exchange, narration if it was heading into more tool calls. */
+  private settle(run: Run, messageId: string, force = false) {
+    const message = run.messages.get(messageId)
+    if (!message || message.role !== "assistant" || !message.finish) return
+    for (const entry of message.texts.values()) {
+      // `force` is for the end of the run: text that never reported its end is still the agent's words.
+      if ((!entry.done && !force) || entry.sent || !entry.text.trim()) continue
+      entry.sent = true
+      if (CONTINUES.has(message.finish)) {
+        run.view.narration.push(entry.text.trim())
+        continue
+      }
+      run.answers.push(entry.text)
+      const text = entry.text
+      run.outbox = run.outbox.then(() => this.surface.sendAnswer(run.target.channelId, text)).catch(report("answer"))
+    }
+  }
+
+  private upsertTool(run: Run, part: ToolPart) {
+    const entry = toolEntry(part)
+    const known = run.view.tools.findIndex((item) => item.callID === entry.callID)
+    if (known === -1) run.view.tools.push(entry)
+    else run.view.tools[known] = entry
+  }
+
+  private onTodos(sessionId: string, todos: Array<{ content: string; status: string }>) {
+    const run = this.runs.get(sessionId)
+    if (!run?.busy) return
+    run.lastEventAt = this.now()
+    run.view.todos = todos.map((todo): TodoEntry => ({ content: todo.content, status: todoStatus(todo.status) }))
+    this.scheduleCard(run)
   }
 
   private async onPermission(permission: { id: string; sessionID: string; permission: string; patterns: string[] }) {
@@ -234,31 +320,33 @@ export class RunManager {
     run.lastEventAt = this.now()
     run.seenActivity = true
     if (this.options.autoApprove) {
-      await this.engine.respondPermission(run.sessionId, permission.id, "once", run.directory).catch(() => undefined)
+      await this.engine.respondPermission(run.target.sessionId, permission.id, "once", run.target.directory).catch(() => undefined)
       return
     }
     await this.surface
-      .askPermission(run.channelId, {
-        sessionId: run.sessionId,
-        id: permission.id,
-        title: permission.permission,
-        detail: permission.patterns.join(", "),
-      })
+      .askPermission(run.target.channelId, { sessionId: run.target.sessionId, id: permission.id, tool: permission.permission, detail: permission.patterns.join(", ") })
       .catch(() => undefined)
   }
 
   private async onStatus(sessionId: string, status: { type: string; attempt?: number; message?: string }) {
     const run = this.runs.get(sessionId)
-    if (!run?.busy) return
+    if (!run) return
     run.lastEventAt = this.now()
+
     if (status.type === "idle") {
       // An idle that arrives before the server did anything for this prompt belongs to the previous turn.
-      if (run.seenActivity) await this.finish(run)
+      if (run.busy && run.seenActivity) await this.finish(run)
       return
     }
+    if (!run.busy) {
+      // The agent started working without us asking (a prompt that raced the previous run's end, or opencode continuing
+      // on its own): show it instead of letting its output vanish.
+      if (run.finishing) await run.finishing
+      this.begin(run)
+    }
     run.seenActivity = true
-    run.retryNote = status.type === "retry" ? `재시도 ${status.attempt ?? ""}회: ${status.message ?? ""}`.trim() : undefined
-    this.scheduleProgress(run)
+    run.view.retry = status.type === "retry" ? `재시도 ${status.attempt ?? ""}회: ${status.message ?? ""}`.trim() : undefined
+    this.scheduleCard(run)
   }
 
   private onError(sessionId: string | undefined, error: { name: string; data?: unknown } | undefined) {
@@ -266,99 +354,103 @@ export class RunManager {
     if (!run) return
     run.seenActivity = true
     if (!error || error.name === "MessageAbortedError") return
-    run.failure = describeError(error)
+    run.view.failure = describeError(error)
   }
 
-  private deliverText(run: Run, partId: string) {
-    const entry = run.texts.get(partId)
-    if (!entry || entry.delivered || !entry.text.trim()) return
-    entry.delivered = true
-    const text = entry.text
-    run.outbox = run.outbox.then(() => this.surface.send(run.channelId, text)).catch(report("send"))
-  }
-
-  private scheduleProgress(run: Run) {
-    run.progressDirty = true
-    if (run.progressTimer) return
-    const wait = Math.max(0, run.lastEdit + PROGRESS_INTERVAL_MS - this.now())
-    run.progressTimer = setTimeout(() => {
-      run.progressTimer = undefined
-      run.outbox = run.outbox.then(() => this.flushProgress(run, false)).catch(report("progress"))
+  private scheduleCard(run: Run, immediate = false) {
+    run.cardDirty = true
+    if (run.cardTimer) return
+    const wait = immediate ? 0 : Math.max(0, run.lastCard + CARD_INTERVAL_MS - this.now())
+    run.cardTimer = setTimeout(() => {
+      run.cardTimer = undefined
+      run.outbox = run.outbox.then(() => this.flushCard(run)).catch(report("card"))
     }, wait)
   }
 
-  private async flushProgress(run: Run, final: boolean) {
-    if (!run.progressDirty && !final) return
-    const text = renderProgress(run, final)
-    if (!text || text === run.progressShown) return
-    run.progressDirty = false
-    run.progressShown = text
-    run.lastEdit = this.now()
-    if (run.progressId) return this.surface.editProgress(run.channelId, run.progressId, text)
-    run.progressId = await this.surface.createProgress(run.channelId, text)
+  private async flushCard(run: Run) {
+    const snapshot = JSON.stringify({ ...run.view, tools: run.view.tools.map((tool) => [tool.callID, tool.status, tool.ended]), narration: run.view.narration.length })
+    if (!run.cardDirty && run.cardShown === snapshot) return
+    run.cardDirty = false
+    run.cardShown = snapshot
+    run.lastCard = this.now()
+    run.cardId = await this.surface.showRun(run.target.channelId, run.view, run.cardId)
   }
 
-  private async finish(run: Run) {
-    if (!run.busy || run.finishing) return
-    // `busy` stays true until the outbox is drained and the queue is checked, so a message arriving meanwhile
-    // is queued instead of starting a second prompt on the same session.
-    run.finishing = true
-    this.clearTimers(run)
-    for (const id of run.texts.keys()) this.deliverText(run, id)
-    run.outbox = run.outbox.then(() => this.flushProgress(run, true)).catch(report("progress"))
-    if (run.failure) {
-      const message = `⚠️ ${run.failure}`
-      run.outbox = run.outbox.then(() => this.surface.send(run.channelId, message)).catch(report("send"))
-    }
-    await run.outbox
-    run.finishing = false
+  private finish(run: Run) {
+    if (!run.busy || run.finishing) return run.finishing ?? Promise.resolve()
+    // `busy` stays true until the outbox is drained, so a prompt that arrives meanwhile waits for the end of this run
+    // and then starts a new one, instead of being steered into a run that is already over.
+    run.finishing = this.close(run).finally(() => {
+      run.finishing = undefined
+    })
+    return run.finishing
+  }
 
-    const next = run.queue.shift()
-    if (!next) {
-      run.busy = false
-      this.options.onIdle?.(run.sessionId, run.channelId)
-      return
+  private async close(run: Run) {
+    this.clearTimers(run)
+    for (const id of run.messages.keys()) {
+      const message = run.messages.get(id)!
+      // Anything still unsent when the agent goes idle is the answer, whatever the last turn's finish reason was.
+      if (message.role === "assistant" && !message.finish) message.finish = "stop"
+      this.settle(run, id, true)
     }
-    // Everything that arrived while busy goes out as one follow-up turn.
-    const rest = run.queue.splice(0)
-    await this.start(run, { ...next, parts: [next, ...rest].flatMap((item) => item.parts) })
+    run.view.state = run.aborted ? "stopped" : run.view.failure ? "failed" : "done"
+    run.view.endedAt = this.now()
+    run.cardDirty = true
+    run.outbox = run.outbox.then(() => this.flushCard(run)).catch(report("card"))
+    await run.outbox
+    run.busy = false
+
+    const files = [...new Set(run.view.tools.flatMap((tool) => (tool.status === "completed" && tool.file ? [tool.file] : [])))]
+    this.options.onIdle?.(run.target.sessionId, run.target.channelId, {
+      state: run.view.state,
+      tools: run.view.tools.length,
+      files,
+      steered: run.view.steered,
+      elapsedMs: (run.view.endedAt ?? this.now()) - run.view.startedAt,
+      answer: run.answers.at(-1) ?? "",
+    })
   }
 
   private clearTimers(run: Run) {
     if (run.typingTimer) clearInterval(run.typingTimer)
-    if (run.progressTimer) clearTimeout(run.progressTimer)
+    if (run.cardTimer) clearTimeout(run.cardTimer)
     run.typingTimer = undefined
-    run.progressTimer = undefined
+    run.cardTimer = undefined
   }
 }
 
-function renderProgress(run: Run, final: boolean) {
-  if (run.tools.size === 0) return run.retryNote ? `⏳ ${run.retryNote}` : ""
-  const lines = [...run.tools.values()].slice(-PROGRESS_LINES).map((item) => `${icon(item.status)} **${item.tool}** ${item.label}`.trimEnd())
-  const hidden = run.tools.size - lines.length
-  const header = final
-    ? `${run.failure ? "⚠️" : "✅"} 작업 ${run.failure ? "중단" : "완료"} · 도구 ${run.toolCount}회`
-    : `🔧 작업 중… 도구 ${run.toolCount}회${run.retryNote ? ` · ⏳ ${run.retryNote}` : ""}`
-  return [header, hidden > 0 ? `… 외 ${hidden}개` : "", ...lines].filter(Boolean).join("\n").slice(0, 1900)
+function toolEntry(part: ToolPart): ToolEntry {
+  const state = part.state
+  const metadata = "metadata" in state && state.metadata ? state.metadata : {}
+  const diff = metadata.filediff as { file?: string; additions?: number; deletions?: number } | undefined
+  const filePath = typeof state.input.filePath === "string" ? state.input.filePath : diff?.file
+  const exit = typeof metadata.exit === "number" ? metadata.exit : undefined
+  // A shell command that exits non-zero is a completed tool call as far as opencode is concerned, but a failure to a reader.
+  const failed = state.status === "error" || (state.status === "completed" && exit !== undefined && exit !== 0)
+  const output = state.status === "completed" ? state.output : state.status === "error" ? state.error : undefined
+  return {
+    callID: part.callID,
+    tool: part.tool,
+    status: failed ? "error" : state.status,
+    title: state.status === "completed" || (state.status === "running" && state.title) ? (state.title ?? "") : "",
+    input: state.input,
+    started: "time" in state ? state.time.start : undefined,
+    ended: state.status === "completed" || state.status === "error" ? state.time.end : undefined,
+    exit,
+    tail: failed && output ? output.trim().split("\n").slice(-4).join("\n") : undefined,
+    file: part.tool === "edit" || part.tool === "write" || part.tool === "apply_patch" ? filePath : undefined,
+    additions: diff?.additions,
+    deletions: diff?.deletions,
+  }
 }
 
-function icon(status: ToolLine["status"]) {
-  if (status === "completed") return "✅"
-  if (status === "error") return "❌"
-  return "⚙️"
+function todoStatus(status: string): TodoEntry["status"] {
+  return status === "completed" || status === "in_progress" || status === "cancelled" ? status : "pending"
 }
 
-function toolLabel(state: ToolState) {
-  if (state.status === "completed") return trim(state.title)
-  if (state.status === "error") return trim(state.error)
-  if (state.status === "running" && state.title) return trim(state.title)
-  const first = Object.values(state.input).find((value): value is string => typeof value === "string")
-  return first ? trim(first) : ""
-}
-
-function trim(text: string) {
-  const line = text.replace(/\s+/g, " ").trim()
-  return line.length > 90 ? `${line.slice(0, 89)}…` : line
+function sum<T extends string>(items: Array<Record<T, number>>, key: T) {
+  return items.reduce((total, item) => total + item[key], 0)
 }
 
 function describeError(error: { name: string; data?: unknown }) {

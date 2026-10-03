@@ -31,6 +31,7 @@ export type Deploy = {
   description?: string
   autorestart?: boolean
   owner_thread?: string | null
+  project?: string | null
   created_by?: string | null
 }
 
@@ -80,6 +81,7 @@ export class ServiceManager {
       last_exit: null,
       started_at: null,
       owner_thread: input.owner_thread ?? existing?.owner_thread ?? null,
+      project: input.project ?? existing?.project ?? null,
       created_by: input.created_by ?? existing?.created_by ?? null,
     }
     if (existing) this.options.store.update(input.name, base)
@@ -166,6 +168,7 @@ export class ServiceManager {
       command: service.command,
       directory: service.directory,
       description: service.description,
+      project: service.project,
       restarts: service.restarts,
       uptime_s: alive && service.started_at ? Math.round((this.now() - service.started_at) / 1000) : 0,
       last_exit: service.last_exit,
@@ -183,6 +186,7 @@ export class ServiceManager {
       directory: service.directory,
       description: service.description,
       url: this.urlFor(service.port),
+      project: service.project,
     }))
   }
 

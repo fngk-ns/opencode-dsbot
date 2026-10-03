@@ -11,12 +11,13 @@ export type Directive =
   | { kind: "tasks" }
   | { kind: "memory" }
   | { kind: "services" }
+  | { kind: "projects" }
   | { kind: "threads" }
   | { kind: "fork" }
   | { kind: "cache" }
   | { kind: "restart" }
 
-const FLAGS = new Set(["self", "new", "stop", "status", "help", "models", "tasks", "memory", "services", "threads", "fork", "cache", "restart"])
+const FLAGS = new Set(["self", "new", "stop", "status", "help", "models", "tasks", "memory", "services", "projects", "threads", "fork", "cache", "restart"])
 const WITH_ARGUMENT = new Set(["project", "model", "agent"])
 
 /**
@@ -56,12 +57,12 @@ export const HELP_TEXT = [
   "• 파일을 첨부하면 작업 폴더에 저장되어 에이전트가 읽습니다. 만들어진 파일/긴 코드는 첨부파일로 돌려줍니다.",
   "",
   "**명령어** (요청 맨 앞에 붙임)",
-  "• `/project <이름>` 작업 프로젝트 선택 (스레드 시작 또는 `/new` 와 함께)",
+  "• `/project <이름>` 작업 프로젝트 선택 — 없으면 새로 만듭니다 (말로 「저번에 만든 블로그에 …」 해도 알아서 찾아요)",
   "• `/self` 봇 자신의 코드를 수정하는 세션 (소유자 전용)",
   "• `/model <provider/model>` 또는 `/model sonnet` 처럼 이름 일부로 모델 변경 · `/models` 쓸 수 있는 모델 목록 · `/agent <이름>`",
   "• 말로 해도 됩니다: `@봇 claude sonnet 모델로 바꿔줘`",
   "• `/fork 제목` 지금 대화를 **브랜치**로 갈라 새 스레드에서 이어가기 (git 프로젝트면 전용 브랜치/작업폴더)",
-  "• `/tasks` 열린 작업 · `/memory` 공통 메모리 · `/threads` 지난 스레드 · `/services` 배포된 서비스와 포트",
-  "• `/new` 새 세션으로 시작 · `/stop` 진행 중인 작업 중단",
+  "• `/projects` 만들어 둔 프로젝트 · `/tasks` 열린 작업 · `/memory` 공통 메모리 · `/threads` 지난 스레드 · `/services` 배포된 서비스와 포트",
+  "• `/new` 새 세션으로 시작 · `/stop` 진행 중인 작업 중단 (작업 중에 보낸 메시지는 대기 없이 바로 에이전트에게 전달돼요)",
   "• `/status` 상태 · `/cache` 캐시 현황 · `/restart` 봇 재시작 (소유자 전용)",
 ].join("\n")

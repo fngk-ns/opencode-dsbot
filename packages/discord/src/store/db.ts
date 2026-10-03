@@ -84,6 +84,21 @@ export function openDatabase(file: string) {
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
   )`)
+  db.run(`CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    title TEXT,
+    description TEXT,
+    directory TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '[]',
+    summary TEXT,
+    last_thread TEXT,
+    created_by TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )`)
+  // Databases created before projects existed lack this column.
+  const serviceColumns = db.query("PRAGMA table_info(services)").all() as Array<{ name: string }>
+  if (!serviceColumns.some((column) => column.name === "project")) db.run("ALTER TABLE services ADD COLUMN project TEXT")
   db.run(`CREATE TABLE IF NOT EXISTS audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at INTEGER NOT NULL,

@@ -72,3 +72,30 @@ describe("userPrompt", () => {
     expect(text.endsWith("첨부된 파일을 확인하고 필요한 작업을 해줘.")).toBe(true)
   })
 })
+
+describe("systemPrompt playbooks", () => {
+  const input = { kind: "project" as const, directory: "/ws/_home", selfDir: "/opt/bot", maxUploadMb: 10 }
+
+  test("a thread in the workspace home must choose a project first", () => {
+    const text = systemPrompt({ ...input, home: true })
+    expect(text).toContain("WORKSPACE HOME")
+    expect(text).toContain("discord_project open")
+    expect(text).toContain("discord_project create")
+    expect(text).toContain("STOP")
+  })
+
+  test("a thread in a project is told to verify, finish (merge), deploy from trunk and report the address", () => {
+    const text = systemPrompt({ ...input, directory: "/ws/.worktrees/blog/x-1", project: { name: "blog", trunk: "/ws/blog", branch: "thread/x-1" } })
+    expect(text).toContain('project "blog"')
+    expect(text).toContain("thread/x-1")
+    expect(text).toContain("/ws/blog")
+    expect(text).toContain("discord_project finish")
+    expect(text).toContain("discord_service deploy")
+    expect(text).toContain("address")
+    expect(text).not.toContain("WORKSPACE HOME")
+  })
+
+  test("the Projects list is explained so earlier work is continued, not redone", () => {
+    expect(systemPrompt({ ...input })).toContain("저번에 만든 블로그")
+  })
+})

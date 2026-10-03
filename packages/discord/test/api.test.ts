@@ -14,6 +14,8 @@ import { AuditLog } from "../src/admin/audit"
 import { PendingActions } from "../src/admin/pending"
 import type { GuildPort } from "../src/admin/types"
 import { MemoryStore } from "../src/memory/store"
+import { ProjectManager } from "../src/projects/manager"
+import { ProjectStore } from "../src/projects/store"
 import { ServiceManager } from "../src/services/manager"
 import { ServiceStore } from "../src/services/store"
 
@@ -115,7 +117,11 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean;
   })
   const branches: Array<{ title: string; history: boolean; prompt?: string }> = []
   const confirms: Array<{ description: string; run: () => Promise<string> }> = []
-  const current: ApiContext = { channelId: "c1", guildId: "g1", directory: path.join(temp, "project"), project: "project", kind: "project", speakerId: "owner1", ...context }
+  const projects = new ProjectStore(db)
+  const manager = new ProjectManager({ store: projects, workspaceDir: path.join(temp, "ws"), memory })
+  const announced: Array<{ name: string; url: string | null; project: string | null }> = []
+  const moves: Array<{ project: string; created: boolean }> = []
+  const current: ApiContext = { channelId: "c1", guildId: "g1", directory: path.join(temp, "project"), project: "project", trunk: null, branch: null, kind: "project", speakerId: "owner1", ...context }
   const deps: ApiDeps = {
     token: TOKEN,
     lookup: createLookup({
@@ -129,7 +135,7 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean;
     }),
     context: (sessionId) => (sessionId === "ses_1" ? current : undefined),
     guildOfChannel: (channelId) => ({ c1: "g1", c2: "g1", c9: "g2" })[channelId],
-    roots: (value) => [value.directory],
+    roots: (value) => [value.directory, path.join(temp, "ws")],
     maxUploadBytes: 1024,
     send: async (channelId, text, files) => void sent.push({ channelId, text, files }),
     restart: async (_, reason) => (restarts.push(reason), { ok: true, message: "queued" }),
@@ -145,6 +151,11 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean;
     speakerName: (_, userId) => userId,
     branch: async (_, input) => (branches.push(input), { ok: true, thread: "<#new>", session_id: "ses_new", directory: "/w", branch: "thread/x", inherited_history: input.history }),
     close: async () => ({ ok: true, message: "closed" }),
+    announceService: async (_, deployed) => void announced.push(deployed),
+    projects,
+    manager,
+    serviceSummaries: () => services.summaries(),
+    moveThread: async (_, name, created) => (moves.push({ project: name, created }), { ok: true, directory: path.join(temp, "ws", ".worktrees", name, "t"), branch: `thread/${name}`, trunk: path.join(temp, "ws", name) }),
   }
   const handle = createApiHandler(deps)
   const post = (route: string, body: object, token = TOKEN) =>
@@ -155,7 +166,7 @@ function setup(context: Partial<ApiContext> = {}, options: { noModels?: boolean;
         body: JSON.stringify(body),
       }),
     )
-  return { post, sent, restarts, remoteCalls, handle, modelChanges, memory, services, timeouts, branches, audit, confirms }
+  return { post, sent, restarts, remoteCalls, handle, modelChanges, memory, services, timeouts, branches, audit, confirms, projects, announced, moves }
 }
 
 describe("api auth and routing", () => {
@@ -379,6 +390,59 @@ describe("service tool", () => {
     } finally {
       await t.services.remove("demo")
     }
+  })
+})
+
+describe("service tool with projects", () => {
+  test("a project's service is named after it, runs from trunk, is linked to it and announced with its address", async () => {
+    const trunk = path.join(temp, "ws", "blog")
+    await mkdir(trunk, { recursive: true })
+    await Bun.write(path.join(trunk, "app.js"), "Bun.serve({ port: Number(process.env.PORT), fetch: () => new Response('ok') }); setInterval(() => {}, 1000)\n")
+    // The thread's own worktree has no app.js: a deploy that ran from it would fail.
+    const t = setup({ project: "blog", trunk, directory: path.join(temp, "ws", ".worktrees", "blog", "t"), branch: "thread/x" })
+    try {
+      const result = await (await t.post("/services", { session_id: "ses_1", action: "deploy", command: "bun app.js" })).json()
+      expect(result).toMatchObject({ ok: true, ready: true, project: "blog", url: expect.stringContaining("203.0.113.7:") })
+      expect(t.services.summaries()[0]).toMatchObject({ name: "blog", project: "blog" })
+      expect(t.announced).toEqual([expect.objectContaining({ name: "blog", project: "blog", url: result.url })])
+
+      // Deploying again from a later thread keeps the service, and so the port and the address.
+      const again = await (await t.post("/services", { session_id: "ses_1", action: "deploy", command: "bun app.js" })).json()
+      expect(again.port).toBe(result.port)
+    } finally {
+      await t.services.remove("blog")
+    }
+  })
+})
+
+describe("project tool", () => {
+  test("create makes the repository, registers it and moves the thread into it", async () => {
+    const t = setup({ project: null })
+    const made = await (await t.post("/projects", { session_id: "ses_1", action: "create", name: "shop", title: "쇼핑몰", aliases: ["쇼핑몰"] })).json()
+    expect(made).toMatchObject({ ok: true, created: true, branch: "thread/shop", message: expect.stringContaining("STOP") })
+    expect(t.moves).toEqual([{ project: "shop", created: true }])
+    expect(t.projects.get("shop")).toMatchObject({ title: "쇼핑몰", aliases: ["쇼핑몰"], last_thread: "c1" })
+    const again = await (await t.post("/projects", { session_id: "ses_1", action: "create", name: "shop" })).json()
+    expect(again).toMatchObject({ ok: false, error: expect.stringContaining("already exists") })
+  })
+
+  test("find ranks by what the request says, open enters an existing project, unknown names get suggestions", async () => {
+    const t = setup({ project: null })
+    await t.post("/projects", { session_id: "ses_1", action: "create", name: "diary", title: "내 일기장", aliases: ["일기장"] })
+    const found = await (await t.post("/projects", { session_id: "ses_1", action: "find", query: "저번에 만든 일기장 사이트에 댓글" })).json()
+    expect(found.candidates[0]).toMatchObject({ name: "diary" })
+    const opened = await (await t.post("/projects", { session_id: "ses_1", action: "open", name: "diary" })).json()
+    expect(opened).toMatchObject({ ok: true, branch: "thread/diary" })
+    const missing = await (await t.post("/projects", { session_id: "ses_1", action: "open", name: "diray" })).json()
+    expect(missing).toMatchObject({ ok: false, all: ["diary"] })
+  })
+
+  test("finish needs a project branch and a summary, and info reports the thread's place", async () => {
+    const home = setup({ project: null })
+    expect(await (await home.post("/projects", { session_id: "ses_1", action: "finish", summary: "x" })).json()).toMatchObject({ ok: false, error: expect.stringContaining("create or open") })
+    const t = setup({ project: "blog", branch: "thread/x", trunk: "/ws/blog" })
+    expect(await (await t.post("/projects", { session_id: "ses_1", action: "finish" })).json()).toMatchObject({ ok: false, error: expect.stringContaining("summary") })
+    expect(await (await t.post("/projects", { session_id: "ses_1", action: "info" })).json()).toMatchObject({ ok: true, branch: "thread/x", trunk: "/ws/blog" })
   })
 })
 

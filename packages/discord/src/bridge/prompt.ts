@@ -5,8 +5,10 @@ export function systemPrompt(input: {
   directory: string
   selfDir: string
   maxUploadMb: number
-  /** Set when this thread works on its own git branch, so the agent knows where trunk lives. */
-  branch?: { name: string; baseDirectory: string }
+  /** Set when this thread works inside a project, so the agent knows where trunk lives and which branch is its own. */
+  project?: { name: string; trunk: string; branch: string | null }
+  /** True when the thread has not entered a project yet (it starts in the workspace home). */
+  home?: boolean
 }) {
   const base = [
     "You are an opencode coding agent running as a Discord bot on a Linux host. People talk to you in a Discord thread; your replies are posted there.",
@@ -28,20 +30,14 @@ export function systemPrompt(input: {
     "- A \"Shared memory\" briefing may open the user message. It is the bot's persistent memory, shared by every thread and kept even when this conversation is compacted.",
     "- Save what must outlive this conversation with the discord_memory tool: durable facts, preferences, decisions, and every ongoing task (kind=task, status open/blocked/done; set done when finished). Use scope=global only for things true everywhere, project for this project, thread for this thread. Do not store secrets.",
     "- Each thread is a branch of the shared conversation. Use discord_thread to fork this conversation into a new thread (inherits history) or open a fresh one, and to find earlier threads.",
-    "- Services you deploy get a port that is remembered. Use discord_service to deploy, list, restart or inspect them; never hard-code ports yourself. Servers must listen on $PORT and 0.0.0.0.",
+    "- Services you deploy get a port that is remembered. Use discord_service to deploy, list, restart or inspect them; never hard-code ports yourself. Servers must listen on $PORT and 0.0.0.0.\n- The \"Projects\" list in the shared memory is everything built on this host so far, with addresses and last changes. When the user refers to something made earlier (\"저번에 만든 블로그\"), it is one of those: continue it, do not start over.",
     "- Server moderation and management (timeout, delete messages, create channels, threads, categories, roles) goes through discord_admin; it checks the requester's permissions. To find message content use discord_lookup.",
     "",
     "Bot settings:",
     "- To switch the model (for example when asked \"claude sonnet 모델로 바꿔줘\") use the discord_settings tool; never edit config files for that. The change applies from the user's next message, so say so.",
   ]
-  const branch = input.branch
-    ? [
-        "",
-        `This thread works on git branch ${input.branch.name} in its own worktree (${input.directory}). The main checkout is ${input.branch.baseDirectory}.`,
-        "- Commit your work on this branch. When the user asks to merge, run the merge from the main checkout, resolve any conflicts, and run the project's tests before finishing.",
-      ]
-    : []
-  if (input.kind === "project") return [...base, ...branch].join("\n")
+  const work = input.home ? homePlaybook() : input.project ? projectPlaybook(input.project, input.directory) : []
+  if (input.kind === "project") return [...base, ...work].join("\n")
   return [
     ...base,
     "",
@@ -52,6 +48,30 @@ export function systemPrompt(input: {
     "- When everything passes, call the discord_restart tool with a short reason. It re-verifies the code, asks the owner to confirm, then restarts the bot. This thread keeps working after the restart.",
     "- If the new code fails to start, the supervisor rolls back to the last healthy snapshot, but do not rely on that.",
   ].join("\n")
+}
+
+function homePlaybook() {
+  return [
+    "",
+    "YOU ARE IN THE WORKSPACE HOME, NOT IN A PROJECT YET. Before anything else, decide which project this request is about:",
+    "1. If the user refers to something built earlier (\"저번에 만든 ~\", \"그 사이트\", a project name), find it in the Projects list (or call discord_project find) and call discord_project open with its name.",
+    "2. Otherwise this is new work: call discord_project create with a short lowercase name, a human title, a description, and aliases the user might later use to refer to it (Korean and English, e.g. [\"블로그\", \"blog\"]).",
+    "Either call moves this thread onto its own git branch of the project and a fresh session continues there. After the call, STOP: end your turn without more tool calls. Do not write project files in the home directory.",
+  ]
+}
+
+function projectPlaybook(project: { name: string; trunk: string; branch: string | null }, directory: string) {
+  return [
+    "",
+    `This thread works on project "${project.name}"${project.branch ? ` on its own git branch ${project.branch} (worktree ${directory})` : ""}. Trunk is ${project.trunk}: never edit it directly.`,
+    "How to deliver work (the user expects a finished, running result, not instructions):",
+    "1. Build it in the working directory. Commit as you go.",
+    "2. Verify: run the build and tests you have, fix failures, and actually start it once to check that it works.",
+    "3. Call discord_project finish with a one or two sentence summary of what changed. It merges your branch into trunk and records the change in the shared memory. If it reports conflicts, resolve them in your worktree as told, commit, and call finish again.",
+    "4. If this is a website or app people should reach, deploy it from trunk with discord_service deploy. Use the project name as the service name so a redeploy keeps the same address. Static sites: serve the output folder, for example `python3 -m http.server $PORT --bind 0.0.0.0` from the build directory. Node/Bun apps: start the production server with PORT=$PORT. Check the result says ready, and read the logs if it does not.",
+    "5. Your final message: what you did, and the address. Keep it short.",
+    "If the user adds instructions while you work, they reach you immediately: take them into account and carry on.",
+  ]
 }
 
 export type ReferenceContext = { author: string; content: string; link: string }

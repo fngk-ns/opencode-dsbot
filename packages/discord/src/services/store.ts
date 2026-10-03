@@ -19,6 +19,8 @@ export type ServiceRecord = {
   started_at: number | null
   log_file: string
   owner_thread: string | null
+  /** The project this service serves, so a project's address can be found from its name. */
+  project: string | null
   created_by: string | null
   created_at: number
   updated_at: number
@@ -52,8 +54,8 @@ export class ServiceStore {
     const now = Date.now()
     this.db
       .query(
-        `INSERT INTO services (name, description, directory, command, port, env, desired, autorestart, pid, pid_start, status, restarts, last_exit, started_at, log_file, owner_thread, created_by, created_at, updated_at)
-         VALUES ($name, $description, $directory, $command, $port, $env, $desired, $autorestart, $pid, $pid_start, $status, $restarts, $last_exit, $started_at, $log_file, $owner_thread, $created_by, $now, $now)`,
+        `INSERT INTO services (name, description, directory, command, port, env, desired, autorestart, pid, pid_start, status, restarts, last_exit, started_at, log_file, owner_thread, project, created_by, created_at, updated_at)
+         VALUES ($name, $description, $directory, $command, $port, $env, $desired, $autorestart, $pid, $pid_start, $status, $restarts, $last_exit, $started_at, $log_file, $owner_thread, $project, $created_by, $now, $now)`,
       )
       .run(bind(record, now))
     return this.get(record.name)!
@@ -68,7 +70,7 @@ export class ServiceStore {
         `UPDATE services SET description = $description, directory = $directory, command = $command, port = $port, env = $env,
            desired = $desired, autorestart = $autorestart, pid = $pid, pid_start = $pid_start, status = $status,
            restarts = $restarts, last_exit = $last_exit, started_at = $started_at, log_file = $log_file,
-           owner_thread = $owner_thread, created_by = $created_by, updated_at = $now
+           owner_thread = $owner_thread, project = $project, created_by = $created_by, updated_at = $now
          WHERE name = $name`,
       )
       .run(bind(next, Date.now()))
@@ -98,6 +100,7 @@ function bind(record: Omit<ServiceRecord, "created_at" | "updated_at">, now: num
     $started_at: record.started_at,
     $log_file: record.log_file,
     $owner_thread: record.owner_thread,
+    $project: record.project,
     $created_by: record.created_by,
     $now: now,
   }

@@ -136,3 +136,25 @@ describe("buildDigest", () => {
     expect(digestHash("a")).not.toBe(digestHash("b"))
   })
 })
+
+describe("buildDigest projects", () => {
+  const projects = [
+    { name: "blog", title: "내 블로그", description: "Next.js 개인 블로그", aliases: ["블로그", "blog"], url: "http://1.2.3.4:24001", summary: "댓글 기능 추가", directory: "/ws/blog" },
+    { name: "shop", title: null, description: null, aliases: [], url: null, summary: null, directory: "/ws/shop" },
+  ]
+
+  test("lists every project with its aliases, address and last change so a request can be matched to it", () => {
+    const text = buildDigest({ entries: [], services: [], projects, recent: [] })
+    expect(text).toContain("## Projects on this host")
+    expect(text).toContain('- blog "내 블로그" [블로그, blog] — Next.js 개인 블로그 · live at http://1.2.3.4:24001 · last change: 댓글 기능 추가')
+    expect(text).toContain("- shop · not deployed")
+  })
+
+  test("projects outrank plain notes when the budget is small", () => {
+    const m = store()
+    for (let index = 0; index < 30; index++) m.save({ scope: "global", kind: "note", title: `n${index}`, body: "x".repeat(200) })
+    const text = buildDigest({ entries: m.list({ scopes: ["global"], limit: 100 }), services: [], projects, recent: [], budget: 700 })
+    expect(text).toContain("blog")
+    expect(text).toContain("shop")
+  })
+})

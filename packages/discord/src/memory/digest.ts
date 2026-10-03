@@ -8,6 +8,17 @@ export type ServiceSummary = {
   directory: string
   description: string | null
   url: string | null
+  project?: string | null
+}
+
+export type ProjectSummary = {
+  name: string
+  title: string | null
+  description: string | null
+  aliases: string[]
+  url: string | null
+  summary: string | null
+  directory: string
 }
 
 const LINE_LIMIT = 280
@@ -20,6 +31,7 @@ const LINE_LIMIT = 280
 export function buildDigest(input: {
   entries: MemoryEntry[]
   services: ServiceSummary[]
+  projects?: ProjectSummary[]
   thread?: ThreadRecord
   parent?: ThreadRecord
   recent: ThreadRecord[]
@@ -43,6 +55,7 @@ export function buildDigest(input: {
   const lineage = pick(lineageLines(input.thread, input.parent))
   const always = pick(pinned.map(entryLine))
   const open = pick(tasks.map(entryLine))
+  const projects = pick((input.projects ?? []).map(projectLine))
   const services = pick(input.services.map(serviceLine))
   const facts = pick(knowledge.map(entryLine))
   const threads = pick(input.recent.filter((item) => item.thread_id !== input.thread?.thread_id).map(threadLine))
@@ -51,6 +64,7 @@ export function buildDigest(input: {
     section("This thread", lineage),
     section("Always remember", always),
     section("Open tasks", open),
+    section("Projects on this host (continue these; open one with discord_project)", projects),
     section("Services on this host (port → service)", services),
     section("Decisions, facts and notes", facts),
     section("Other threads (most recent first)", threads),
@@ -77,6 +91,14 @@ function entryLine(entry: MemoryEntry) {
   const status = entry.kind === "task" ? ` ${entry.status}` : ""
   const scope = entry.scope === "global" ? "" : ` ${entry.scope}`
   return `- #${entry.id} [${entry.kind}${status}${scope}] ${entry.title}: ${flat(entry.body)}`
+}
+
+function projectLine(project: ProjectSummary) {
+  const names = project.aliases.length > 0 ? ` [${project.aliases.join(", ")}]` : ""
+  const about = project.description ? ` — ${flat(project.description)}` : ""
+  const where = project.url ? ` · live at ${project.url}` : " · not deployed"
+  const last = project.summary ? ` · last change: ${flat(project.summary)}` : ""
+  return `- ${project.name}${project.title ? ` "${project.title}"` : ""}${names}${about}${where}${last}`
 }
 
 function serviceLine(service: ServiceSummary) {
